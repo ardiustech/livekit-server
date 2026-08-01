@@ -67,25 +67,66 @@ solving root cause or papering over it.
     idle, load avg 4.24 at check time. Inconclusive for the actual test
     window (checked after, not during) — John disputed the "heavy load"
     explanation and he's right that it wasn't verified before being asserted.
-12. **The e2e harness launches all N peers' Chromium processes and joins
-    them essentially simultaneously** (`e2e/sfu-multi-peer.spec.ts`) — a
-    burst-concurrency pattern that does NOT match production (people
-    trickling into a meeting over seconds), and IS a plausible explanation
-    for why local severity (nearly universal failure) vastly exceeds
-    production severity (one incident).
+12. **CORRECTED (was wrong in the first pass of this log):** the e2e harness
+    does NOT join peers simultaneously — `e2e/sfu-multi-peer.spec.ts`'s join
+    loop already staggers each peer by 4 seconds (`"Trickle join (~4s
+    apart), not simultaneous. People walk into a room over time"`, its own
+    comment). H1 as originally stated (simultaneous-burst-join causes the
+    amplification) is **ruled out** — there is no burst in this harness.
+    Caught before wasting a test run on it (checked the spec file first,
+    per John's explicit ask to analyze before testing).
 13. Stock server logs during the control run also showed: `WARN "UDP receive
     buffer is too small for a production set-up" {"current": 425984,
     "suggested": 5000000}`. Flagged in the original 2026-07-30 triage doc as
     "not a contributor at 5 people... will bite at 40" — worth re-examining
     given today's much higher failure rate at exactly 5 peers.
 
+14. **N=2 control (minimum possible peer count, same stock image, same
+    staggered-join code path):** still failed — `1/2 peers never saw flowing
+    video`, both peers hit `"publication of local track timed out, no
+    response from server"`. Server-side: **187 `could not get mid` events**
+    and 3 `publish time out` supervisor errors in a ~1-minute run with only
+    2 people. 23 tracks published successfully in the same window (a mix of
+    success and failure, not total breakdown like N=5). No panics/fatal
+    errors; no UDP-buffer warning this time (possibly only logged once per
+    container lifetime, not per-run).
+
 ## Hypotheses (unconfirmed — state confidence + what would confirm/refute)
 
-- **H1 (testing now):** Local e2e severity is amplified by CONCURRENT BURST
-  JOIN LOAD (all 5 peers negotiating at the exact same instant), not
-  representative of production's actual occurrence rate. **Test:** stagger
-  peer joins by 1-2s each instead of launching simultaneously; expect
-  failure rate to drop sharply if true.
+- **H1 — RULED OUT (fact #12):** "simultaneous burst join" was wrong; the
+  harness already staggers joins 4s apart. Not the explanation.
+- **H1b (testing now, replaces H1):** Local e2e severity is driven by
+  CUMULATIVE STEADY-STATE LOAD, not a join burst — 5 REAL Chromium processes
+  each doing continuous real-time WebRTC encode/decode on ONE laptop is a
+  substantial, ever-growing total load even with staggered starts (by the
+  time peer 5 joins at ~16s, peers 0-3 are ALL still actively
+  encoding/decoding/publishing/subscribing). Production's SFU runs on a
+  dedicated c6i.2xlarge EC2 box with no competing browser processes at all.
+  **Test:** re-run with far fewer peers (N=2) — much lower cumulative load,
+  same staggered-join code path — and see if the failure rate drops sharply.
+  **Result (fact #14): partially confirmed.** End-to-end failure rate DID
+  drop a lot (5/5 peers failing → 1/2), consistent with cumulative load
+  making things WORSE. But it did NOT go away, and the underlying race
+  itself is still extremely frequent even at N=2 (187 `could not get mid`
+  events for 2 people in ~1 minute — orders of magnitude more than
+  production's 215 events across an entire real incident). **Revised
+  reading:** two separate things are true at once — (a) this specific LOCAL
+  Docker/colima test environment has a much higher BASELINE rate of the
+  underlying race than real production, for reasons not yet identified
+  (H4 — networking virtualization, resource limits, or something else
+  entirely), independent of peer count; AND (b) higher peer count/load makes
+  it MORE LIKELY that a given occurrence exhausts all retries and becomes a
+  user-visible failure, rather than getting fixed by one of the incidental
+  retry paths in time. Both matter, neither alone explains everything.
+- **H4 (upgraded — now the leading candidate for why LOCAL baseline severity
+  is so much higher than production):** something about this specific local
+  Docker/colima setup (NATed/virtualized networking adding latency to
+  signaling or media, resource limits, or a different code path entirely)
+  causes the underlying mid-race to fire far more often than on production's
+  dedicated EC2 box, regardless of peer count. **Not yet tested directly** —
+  would need e.g. comparing signaling RTT/timing between local and prod, or
+  testing against a non-Docker (bare-metal Go binary) local LiveKit instance
+  to isolate whether Docker/colima itself is a factor.
 - **H2 (weakened, not disproven, just unlocated):** A cross-goroutine race
   between mid-assignment and RTP-dispatch. Fact #6 shows this does NOT
   happen the naive way (within one offer's SEQUENTIAL processing). The real
@@ -123,24 +164,34 @@ solving root cause or papering over it.
 
 ## Current strategy / next steps
 
-1. **[NEXT]** Run a staggered-peer-join variant of the e2e test (peers
-   joining ~1-2s apart instead of simultaneously) to test H1.
-2. If H1 confirms (staggered join → much lower failure rate): re-run the
-   diagnostic self-resolution poller (experiment #1's design) under
-   STAGGERED conditions — the "0% self-resolution" data point in fact #9 was
-   gathered under an extreme burst with 16 SIMULTANEOUSLY stuck tracks, not
-   the realistic "one isolated stuck track" production scenario. Need to
-   confirm the conclusion still holds before fully trusting it as the
-   justification for PR #1's design.
-3. Consider a fewer-peers variant (2-3 simultaneous) as an alternative lower
-   -burst-intensity test.
-4. If H4 looks plausible after #1-3, try raising `net.core.rmem_max` (or the
-   Docker VM's resource allocation) locally and re-testing, to separate
-   "genuine protocol race" from "local resource-starvation artifact."
-5. Once a clean, realistic reproduction of the ORIGINAL narrow bug (≈1 stuck
-   track, not 16) is achieved, re-run the diagnostic poller against THAT
-   specifically before treating the "renegotiation is required" conclusion
-   as settled for the real production scenario.
+1. ~~Run a staggered-peer-join variant~~ — DONE, moot: harness already
+   staggers 4s (fact #12, corrected). H1 ruled out.
+2. ~~Re-run with fewer peers (N=2)~~ — DONE, see fact #14. Confirms load
+   affects END-TO-END failure rate, but the underlying race has a high
+   baseline in THIS environment independent of peer count.
+3. **[NEXT, not yet done]** Isolate whether Docker/colima itself is the
+   baseline-severity factor (H4): either (a) compare local vs. production
+   signaling round-trip timing directly, or (b) run the SAME e2e harness
+   against a bare-metal `go run ./cmd/server` LiveKit instance (no Docker at
+   all) and see if the baseline `could not get mid` rate at N=2 drops from
+   ~187/minute to something closer to production's rate.
+4. Once (3) either confirms or rules out the local-environment explanation,
+   THEN re-run the original diagnostic self-resolution poller (experiment
+   #1, fact #9) under whatever configuration produces a realistic ~1-track
+   -stuck scenario (matching production), not the current every-track-affected
+   scenario, before fully trusting "0% self-resolution" as the final word for
+   the real production case. The mechanism-level finding (a full
+   unpublish+republish is what actually flushes a stuck transceiver, per the
+   handlePendingRemoteTracks correlation in fact #9) is likely still valid
+   regardless — that's a property of pion's transceiver state, not of how
+   often the environment gets INTO that state — but hasn't been separately
+   re-confirmed under a low-baseline-rate condition.
+5. **Paused here for a checkpoint with John** (2026-08-01) — this has been a
+   long back-and-forth; before spending more experiment time, confirm
+   whether isolating the Docker/colima variable (step 3) is worth doing now,
+   or whether the existing evidence (mechanism confirmed real via fact #9's
+   correlation with handlePendingRemoteTracks flushes; environment-severity
+   question still open) is enough to proceed with PR #1 as designed.
 
 ## Open questions
 
