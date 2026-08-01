@@ -1531,6 +1531,8 @@ func (pc *PeerConnection) configureRTPReceivers(
 	incomingTracks := trackDetailsFromSDP(pc.log, remoteDesc.parsed)
 	fmt.Printf("ARDIUS-DIAG %s configureRTPReceivers ENTRY isRenegotiation=%v currentTransceivers=%d incomingTracks=%v\n",
 		time.Now().Format(time.RFC3339Nano), isRenegotiation, len(currentTransceivers), diagFmtTrackDetails(incomingTracks))
+	fmt.Printf("ARDIUS-DIAG %s configureRTPReceivers: RAW SDP media sections:\n%s\n",
+		time.Now().Format(time.RFC3339Nano), diagDumpAllMediaSections(remoteDesc.parsed))
 
 	if isRenegotiation { //nolint:nestif
 		for _, transceiver := range currentTransceivers {
@@ -1639,6 +1641,34 @@ func diagFmtTrackDetails(tracks []trackDetails) string {
 		s += fmt.Sprintf("{id=%s ssrcs=%v rids=%v mid=%s}", t.id, t.ssrcs, t.rids, t.mid)
 	}
 	return s + "]"
+}
+
+// ardiustech DIAGNOSTIC ONLY — dumps every media section's mid + kind +
+// direction + the specific attributes relevant to this investigation
+// (rid, simulcast, ssrc, msid), so a "found_no_match_in_incoming" event can
+// be diffed against the immediately-preceding renegotiation's dump for the
+// SAME mid to see exactly what disappeared from the SDP text itself.
+func diagDumpAllMediaSections(parsed *sdp.SessionDescription) string {
+	if parsed == nil {
+		return "(nil parsed SDP)"
+	}
+	out := ""
+	interesting := map[string]bool{"mid": true, "rid": true, "simulcast": true, "ssrc": true, "msid": true, "sendonly": true, "recvonly": true, "sendrecv": true}
+	for i, m := range parsed.MediaDescriptions {
+		out += fmt.Sprintf("  [section %d] m=%s %s", i, m.MediaName.Media, m.MediaName.Formats)
+		var attrs []string
+		for _, a := range m.Attributes {
+			if interesting[a.Key] {
+				if a.Value != "" {
+					attrs = append(attrs, fmt.Sprintf("%s:%s", a.Key, a.Value))
+				} else {
+					attrs = append(attrs, a.Key)
+				}
+			}
+		}
+		out += fmt.Sprintf(" attrs=[%s]\n", strings.Join(attrs, " | "))
+	}
+	return out
 }
 
 // startRTPReceivers opens knows inbound SRTP streams from the RemoteDescription.

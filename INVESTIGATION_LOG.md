@@ -239,8 +239,60 @@ solving root cause or papering over it.
       entirely** — would need to capture and diff the raw SDP text of a
       working vs. failing renegotiation to settle this definitively.
 
+20. **ROOT CAUSE CONFIRMED, PRECISELY — the trigger is our own settle-nudge.**
+    Added a full raw-SDP dump to every `configureRTPReceivers` call and
+    re-ran. The key line, right before a 3-transceiver failure cascade:
+    ```
+    configureRTPReceivers ENTRY isRenegotiation=true currentTransceivers=9 incomingTracks=[]
+    ```
+    **This renegotiation's SDP carries ZERO tracks.** Every currently-live
+    simulcast video transceiver (mid=7, 8, 9 — none of them the track
+    supposedly being touched) sees "no match in incoming" simultaneously and
+    gets torn down and replaced, purely because the SDP momentarily declares
+    nothing at all.
+
+    **Timing nails the cause exactly.** Traced one specific failing track
+    (`id=23da60f8...`) from birth: first configured at `20:14:38.211943`.
+    The empty-track renegotiation that killed it fired at `20:14:41.256120`
+    — **3.044 seconds later**. `TRACK_SETTLE_NUDGE_DELAYS_MS[0]` (watercoler
+    client, `LiveKitRoomManager.ts`) is exactly **3000ms**. A second instance
+    in the same run measured 3.049s, a third 3.216s — all within normal
+    jitter of the 3s timer. **This is not a coincidence: the client's own
+    settle-nudge, firing `room.localParticipant.republishAllTracks()` 3
+    seconds after every publish, is what triggers this.**
+
+    **Why this collaterally damages OTHER, healthy tracks:** `republishAllTracks()`
+    is documented (in `LiveKitRoomManager.ts`'s own comment) as calling
+    `unpublishTrack()` THEN republishing over a fresh transceiver — a real,
+    intentional unpublish/republish cycle for the ONE track it's trying to
+    settle. What that comment does NOT account for: **the intermediate
+    "unpublished" SDP state is a renegotiation of the WHOLE peer connection,
+    not just the one track** — so for the brief window where the SDP
+    reflects zero (or fewer) tracks, `configureRTPReceivers`'s "no match in
+    incoming" check fires for EVERY OTHER simulcast transceiver on that same
+    connection too, not just the one being intentionally touched. Their
+    receivers get torn down and replaced right alongside it, and the
+    still-transmitting browser encoder for those OTHER, perfectly-healthy
+    layers produces the orphaned trailing RTP that shows up as "could not
+    get mid for track."
+
+    **This means the existing mitigation is a significant contributor to the
+    problem it was built to fix.** The settle-nudge (`scheduleTrackSettleNudge`,
+    shipped 2026-07-26 specifically to un-stick a raced track) fires
+    automatically after EVERY publish, on a timer, whether or not anything
+    is actually stuck — and each firing has a real chance of freshly
+    breaking OTHER tracks on the same connection via this exact mechanism.
+    In a multi-track, multi-peer room, with every publish scheduling its own
+    3/8/20s nudge cycle, this compounds continuously — plausibly explaining
+    why local baseline severity was so much higher than the isolated,
+    one-track 2026-07-31 production incident (more tracks/peers = more
+    concurrent nudge timers = more collateral churn opportunities).
+
 **Bottom line: this is a simulcast-layer renegotiation churn bug, not a
-generic "first publish" race.** A layer's rid briefly disappears from a
+generic "first publish" race** — and it disproportionately affects local
+tests because the settle-nudge (an existing, timer-based mitigation for a
+DIFFERENT occurrence of this same underlying issue) is itself the primary
+trigger, firing predictably 3/8/20 seconds after every single publish. A layer's rid briefly disappears from a
 renegotiation's SDP while the browser's encoder for that layer is still
 transmitting trailing packets, and pion's receiver-replacement + fallback
 dispatch for the resulting orphaned RTP produces a transceiver-less receiver
