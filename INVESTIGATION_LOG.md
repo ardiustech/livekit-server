@@ -134,6 +134,56 @@ solving root cause or papering over it.
     observes an empty mid" is still open** — haven't found the exact code
     path yet, only proven the timing gap that would allow it.
 
+17. **BREAKTHROUGH — live instrumentation, actual root cause located.** Added
+    real logging (not static reading): patched a local copy of pion
+    (`vendor-fork/pion-webrtc/`, wired via a `go.mod` `replace` directive) to
+    print a timestamped line whenever `SetLocalDescription` returns and
+    whenever the queued `startRTP` closure actually executes (with measured
+    queue delay); added a matching line in `mediaTrackReceived` for both the
+    success and empty-mid cases, including whether `rtpReceiver.RTPTransceiver()`
+    is nil or non-nil. Ran N=2 against a Docker image built with this
+    instrumentation. Confirmed queue delays of **9–72ms** between
+    `SetLocalDescription` returning and `startRTP` actually running — a real,
+    measured async gap, not a guess (this alone answers fact #15/H5 with hard
+    numbers).
+
+    **But the actual failure sequence, read directly off the timeline, is
+    NOT a first-publish race at all:**
+    ```
+    18:53:00.282125Z  mediaTrackReceived: mid OK   trackID=937580dc… ssrc=1741651686 mid=9
+    18:53:00.282233Z  mediaTrackReceived: mid OK   trackID=937580dc… ssrc=1409012324 mid=9
+    18:53:00.283131Z  SetLocalDescription(answer): configureRTPReceivers done, ENQUEUEING startRTP
+    18:53:00.283145Z  SetLocalDescription RETURNING TO CALLER
+    18:53:00.283430Z  startRTP EXECUTING NOW (queued for 285µs)
+    18:53:00.283450Z  startRTP RETURNED
+    18:53:00.318578Z  mediaTrackReceived: EMPTY MID trackID=937580dc… ssrc=1741651686 transceiver=nil
+    18:53:00.318617Z  mediaTrackReceived: EMPTY MID trackID=937580dc… ssrc=1409012324 transceiver=nil
+    ```
+    **The SAME trackID and SAME SSRCs that already successfully resolved
+    (`mid=9`) get processed through `mediaTrackReceived` a SECOND time, ~36ms
+    later, right after a fast renegotiation cycle — and on this second pass,
+    `rtpReceiver.RTPTransceiver()` is nil.** This is not "RTP arrives before
+    the receiver is ready" (that would be a FIRST occurrence, not a repeat of
+    an already-successful track). This is: **a track that already works gets
+    handed to `mediaTrackReceived` again through some OTHER receiver object
+    that was never wired to a transceiver at all**, immediately following a
+    renegotiation.
+18. This directly implicates `configureRTPReceivers`'s renegotiation branch
+    (fact from earlier tracing: `if isRenegotiation { ... receiver.Stop();
+    newReceiver := pc.api.NewRTPReceiver(...); transceiver.setReceiver(newReceiver)
+    } }`) and/or its SSRC de-duplication logic (`filteredTracks` — "if we
+    already have a TrackRemote for a given SSRC don't handle it again",
+    which reads `receiver.Tracks()` on the CURRENT receiver) — if the OLD
+    receiver gets `.Stop()`'d before this de-dup check runs, its SSRC record
+    may no longer show up as "already claimed," causing the SAME SSRC to be
+    treated as a genuinely NEW incoming track and routed to a fresh,
+    not-yet-wired receiver via a DIFFERENT path than the properly-wired
+    `transceiver.setReceiver(newReceiver)` call. **Not yet proven — this is
+    the next thing to instrument specifically** (log inside
+    `configureRTPReceivers` itself: which branch fires, old vs. new receiver
+    pointer identity, and the SSRC de-dup filter's actual input/output for
+    this exact trackID).
+
 ## Hypotheses (unconfirmed — state confidence + what would confirm/refute)
 
 - **H5 (new, strongly supported by fact #15):** The real root cause is that
