@@ -2390,6 +2390,96 @@ func (p *ParticipantImpl) handlePendingRemoteTracks() {
 	}
 }
 
+// ardiustech fork: republishNudgeTopic is a private data-channel topic this
+// fork uses to tell a publisher's OWN client "one of your tracks got stuck
+// unresolved — please renegotiate." Deliberately NOT a new DataPacket oneof
+// variant (that would require forking livekit-protocol AND client-sdk-js too,
+// to add and consume a new wire type) — DataPacket_User already exists
+// upstream for exactly this kind of arbitrary, app-defined payload, and
+// RoomEvent.DataReceived on the STOCK client SDK already surfaces it
+// unmodified. This keeps the fork to a single repo.
+const republishNudgeTopic = "_ardiustech_republish_nudge"
+
+// scheduleStuckPublishNudge checks back on one specific just-received track
+// after a short grace period and, if it's STILL sitting in
+// pendingRemoteTracks unresolved, proactively tells the publishing
+// participant to renegotiate — instead of silently relying on that
+// participant's app happening to trigger an unrelated renegotiation later
+// (see handlePendingRemoteTracks' three call sites, all client-initiated).
+//
+// gracePeriod is short (750ms) and deliberately shorter than any client-side
+// timer-based mitigation might use (e.g. a settle-nudge scheduled at
+// multi-second delays) — the goal is for the SERVER, which already has full
+// knowledge of the exact failure the instant it happens, to react faster and
+// more reliably than a client polling/guessing on a fixed schedule ever
+// could.
+const stuckPublishNudgeGracePeriod = 750 * time.Millisecond
+
+func (p *ParticipantImpl) scheduleStuckPublishNudge(trackID string) {
+	time.AfterFunc(stuckPublishNudgeGracePeriod, func() {
+		p.pendingTracksLock.Lock()
+		pendingTrackIDs := make([]string, len(p.pendingRemoteTracks))
+		for i, rt := range p.pendingRemoteTracks {
+			pendingTrackIDs[i] = rt.track.ID()
+		}
+		p.pendingTracksLock.Unlock()
+		if !isTrackStillPending(pendingTrackIDs, trackID) {
+			// Resolved on its own (some other renegotiation flushed the
+			// queue) in the interim — nothing to do.
+			return
+		}
+		p.sendRepublishNudge(trackID)
+	})
+}
+
+// isTrackStillPending is the pure decision scheduleStuckPublishNudge acts
+// on — pulled out (and taking already-extracted IDs, not
+// []*pendingRemoteTrack) so it's testable with a plain string slice, no
+// live TransportManager/WebRTC stack required. *webrtc.TrackRemote has no
+// exported constructor (every field is private), so a real one can't be
+// built in a unit test at all — extracting IDs before this call is what
+// makes the actual decision logic testable.
+func isTrackStillPending(pendingTrackIDs []string, trackID string) bool {
+	return slices.Contains(pendingTrackIDs, trackID)
+}
+
+// buildRepublishNudgePacket is the pure packet-construction half of
+// sendRepublishNudge — pulled out so the wire shape (identity, topic,
+// payload) is directly assertable in a test without needing a live
+// TransportManager to actually send anything.
+func buildRepublishNudgePacket(identity livekit.ParticipantIdentity, trackID string) *livekit.DataPacket {
+	return &livekit.DataPacket{
+		ParticipantIdentity: string(identity),
+		Value: &livekit.DataPacket_User{
+			User: &livekit.UserPacket{
+				Payload: []byte(fmt.Sprintf(`{"reason":"stuck_mid","trackId":%q}`, trackID)),
+				Topic:   pointer.To(republishNudgeTopic),
+			},
+		},
+	}
+}
+
+// sendRepublishNudge pushes a small marker payload down this SAME
+// participant's own data channel (server -> the participant who's stuck,
+// not a relay to anyone else) via the existing, unmodified DataPacket_User
+// wire type. The app's client-side code (LiveKitRoomManager.ts, in the app
+// repo — no SDK changes needed) listens for RoomEvent.DataReceived with this
+// topic and reacts by calling its own existing republishAllTracks(), the
+// exact same recovery action the app's blind settle-nudge already uses, just
+// triggered by a real signal instead of a timer.
+func (p *ParticipantImpl) sendRepublishNudge(trackID string) {
+	dpData, err := proto.Marshal(buildRepublishNudgePacket(p.Identity(), trackID))
+	if err != nil {
+		p.pubLogger.Errorw("failed to marshal republish-nudge data packet", err, "trackID", trackID)
+		return
+	}
+	if err := p.TransportManager.SendDataMessage(livekit.DataPacket_RELIABLE, dpData); err != nil {
+		p.pubLogger.Warnw("failed to send republish nudge", err, "trackID", trackID)
+		return
+	}
+	p.pubLogger.Infow("sent republish nudge for stuck track", "trackID", trackID)
+}
+
 func (p *ParticipantImpl) onReceivedDataMessage(kind livekit.DataPacket_Kind, data []byte) {
 	if p.IsDisconnected() || !p.CanPublishData() {
 		return
@@ -3224,6 +3314,16 @@ func (p *ParticipantImpl) mediaTrackReceived(
 		)
 		p.pendingTracksLock.Unlock()
 		p.pubLogger.Warnw("could not get mid for track", nil, "trackID", track.ID())
+		// ardiustech fork: this track is now stuck in pendingRemoteTracks with
+		// nothing to flush it except the SAME participant renegotiating again
+		// for an unrelated reason (see handlePendingRemoteTracks' call sites —
+		// all client-initiated: a fresh offer, an AddTrack request, or an
+		// unpublish). Upstream has no mechanism to proactively ask the
+		// publisher to do that, so a track can sit unrecoverable indefinitely
+		// if the app's usage pattern never naturally triggers one. Give the
+		// publisher a real, immediate reason to renegotiate instead of relying
+		// on an app-side blind timer guessing when (or whether) this happened.
+		p.scheduleStuckPublishNudge(track.ID())
 		return nil, false, false, buffer.VideoLayersRid{}
 	}
 
