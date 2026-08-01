@@ -91,7 +91,62 @@ solving root cause or papering over it.
     errors; no UDP-buffer warning this time (possibly only logged once per
     container lifetime, not per-run).
 
+15. **CONFIRMED — the actual asynchronous gap, located precisely.** Traced
+    `SetLocalDescription`/`SetRemoteDescription` in
+    `~/go/pkg/mod/.../pion/webrtc/v4@v4.2.17/peerconnection.go` for our
+    server's exact role (answerer, processing the client's offer for the
+    publish connection — the client always offers for publish, confirmed
+    earlier). Key facts:
+    - In `SetRemoteDescription` (processing the client's OFFER), the calls to
+      `configureRTPReceivers`/`startRTP` are gated by `if weOffer` (lines
+      ~1330-1370) — since our server never offers for publish, **neither
+      function is called from here at all.** Only the mid-assignment loop
+      (fact #6) runs for us in this function.
+    - In `SetLocalDescription` (applying our OWN answer), the `weAnswer`
+      branch (line ~1140) DOES run `configureRTPReceivers(...)`
+      SYNCHRONOUSLY, but wraps the actual receiver-activation in
+      **`pc.ops.Enqueue(func() { pc.startRTP(...) })`** — an ASYNCHRONOUS,
+      QUEUED operation on pion's internal ops goroutine, NOT a direct call.
+    - **This means `SetLocalDescription(answer)` returns to LiveKit's Go
+      code BEFORE `startRTP` (the code that actually activates the receiver
+      to process incoming RTP) has necessarily run.** If LiveKit sends the
+      answer back to the client immediately after `SetLocalDescription`
+      returns (the natural, expected implementation — no reason to believe
+      otherwise), the client can receive it, complete its own negotiation,
+      and start sending RTP — all before the SERVER's own queued `startRTP`
+      has executed on its internal goroutine.
+    - This is a **real, structural, confirmed asynchronous boundary inside
+      pion itself** — not a hypothesis about goroutine scheduling, an actual
+      `pc.ops.Enqueue()` call in the SDK's own source.
+16. **NOT YET CONFIRMED — the exact downstream link from #15 to "mid empty."**
+    `SetMid()` already ran synchronously in `SetRemoteDescription`, well
+    before `SetLocalDescription` — so the negotiated transceiver's mid
+    SHOULD already be set by the time `startRTP` (whenever it actually runs)
+    would cause `OnTrack`/`mediaTrackReceived` to fire normally. Checked one
+    candidate explanation — pion's `handleUndeclaredSSRC` fallback (for RTP
+    that arrives matching no known transceiver, creates a **brand-new**
+    transceiver that never went through `SetMid()` at all) — but that
+    function explicitly **declines** to handle media sections with a `rid`
+    attribute (`if hasRidAttribute { return false, nil }`), and watercooler's
+    simulcast publishes almost certainly declare `rid` — so this SPECIFIC
+    fallback is likely NOT the mechanism here. **The precise link between
+    "RTP arrives before the queued `startRTP` runs" and "`mediaTrackReceived`
+    observes an empty mid" is still open** — haven't found the exact code
+    path yet, only proven the timing gap that would allow it.
+
 ## Hypotheses (unconfirmed — state confidence + what would confirm/refute)
+
+- **H5 (new, strongly supported by fact #15):** The real root cause is that
+  `SetLocalDescription(answer)` returns — and LiveKit sends the answer to
+  the client — before pion's own asynchronously-queued `startRTP` has
+  necessarily activated the receiver. This directly answers John's question
+  "should the client ever send RTP before verifying negotiation is done":
+  the deeper issue isn't client eagerness at all — **the SERVER'S OWN
+  answer tells the client "we're done" before the SERVER has confirmed
+  itself ready to receive.** Not yet confirmed exactly how this connects to
+  the specific "mid empty" symptom (see fact #16), but this is the
+  strongest, most concrete lead so far — a real code-level asynchronous gap,
+  not a scheduling guess.
 
 - **H1 — RULED OUT (fact #12):** "simultaneous burst join" was wrong; the
   harness already staggers joins 4s apart. Not the explanation.
