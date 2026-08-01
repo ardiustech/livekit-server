@@ -2385,9 +2385,55 @@ func (p *ParticipantImpl) handlePendingRemoteTracks() {
 	pendingTracks := p.pendingRemoteTracks
 	p.pendingRemoteTracks = nil
 	p.pendingTracksLock.Unlock()
+	if len(pendingTracks) > 0 {
+		p.pubLogger.Infow("DIAG handlePendingRemoteTracks flushing queue", "count", len(pendingTracks), "at", time.Now().Format(time.RFC3339Nano))
+	}
 	for _, rt := range pendingTracks {
 		p.onMediaTrack(rt.track, rt.receiver)
 	}
+}
+
+// ardiustech DIAGNOSTIC ONLY — NOT part of the shipped fix (see PR #1 on
+// feat/publish-mid-stuck-nudge, a separate branch off this same base).
+// Answers a precise question raised while reviewing that fix: does a stuck
+// track's mid ever resolve WITHOUT any external renegotiation trigger (a
+// cheap local retry would suffice), or does it only ever clear via an
+// actual new offer/AddTrack/unpublish (handlePendingRemoteTracks' three real
+// call sites — a renegotiation, thus client involvement, is genuinely
+// required)? Polls GetPublisherMid on the SAME rtpReceiver every 5ms for up
+// to 15s (comfortably past the client's own 3s/8s/20s settle-nudge schedule)
+// and logs the FIRST successful resolution with elapsed time, or a timeout
+// if it never resolves — never mutates any state, purely observational.
+func (p *ParticipantImpl) diagPollMidResolution(trackID string, rtpReceiver *webrtc.RTPReceiver) {
+	start := time.Now()
+	go func() {
+		const pollInterval = 5 * time.Millisecond
+		const timeout = 15 * time.Second
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		deadline := time.After(timeout)
+		for {
+			select {
+			case <-ticker.C:
+				if mid := p.TransportManager.GetPublisherMid(rtpReceiver); mid != "" {
+					p.pubLogger.Infow(
+						"DIAG mid RESOLVED",
+						"trackID", trackID,
+						"mid", mid,
+						"elapsedSinceStuck", time.Since(start).String(),
+					)
+					return
+				}
+			case <-deadline:
+				p.pubLogger.Infow(
+					"DIAG mid NEVER RESOLVED within timeout",
+					"trackID", trackID,
+					"timeout", timeout.String(),
+				)
+				return
+			}
+		}
+	}()
 }
 
 func (p *ParticipantImpl) onReceivedDataMessage(kind livekit.DataPacket_Kind, data []byte) {
@@ -3224,6 +3270,7 @@ func (p *ParticipantImpl) mediaTrackReceived(
 		)
 		p.pendingTracksLock.Unlock()
 		p.pubLogger.Warnw("could not get mid for track", nil, "trackID", track.ID())
+		p.diagPollMidResolution(track.ID(), rtpReceiver) // ardiustech DIAGNOSTIC ONLY — see diagPollMidResolution
 		return nil, false, false, buffer.VideoLayersRid{}
 	}
 
