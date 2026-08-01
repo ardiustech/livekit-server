@@ -3270,9 +3270,28 @@ func (p *ParticipantImpl) mediaTrackReceived(
 		)
 		p.pendingTracksLock.Unlock()
 		p.pubLogger.Warnw("could not get mid for track", nil, "trackID", track.ID())
+		// ardiustech DIAGNOSTIC ONLY — correlate against the pion-side
+		// ARDIUS-DIAG lines (peerconnection.go) to see whether this fires
+		// before/after SetLocalDescription returns and before/after the
+		// queued startRTP actually executes. Also distinguishes: is the
+		// transceiver link itself missing (nil) vs present-but-mid-empty —
+		// two different failure shapes that point at different mechanisms.
+		tr := rtpReceiver.RTPTransceiver()
+		trState := "transceiver=nil"
+		if tr != nil {
+			trState = fmt.Sprintf("transceiver=non-nil mid=%q direction=%v", tr.Mid(), tr.Direction())
+		}
+		fmt.Printf(
+			"ARDIUS-DIAG %s mediaTrackReceived: EMPTY MID trackID=%s ssrc=%d %s\n",
+			time.Now().Format(time.RFC3339Nano), track.ID(), track.SSRC(), trState,
+		)
 		p.diagPollMidResolution(track.ID(), rtpReceiver) // ardiustech DIAGNOSTIC ONLY — see diagPollMidResolution
 		return nil, false, false, buffer.VideoLayersRid{}
 	}
+	// ardiustech DIAGNOSTIC ONLY — success-path baseline, for comparing
+	// timing against the failure path above.
+	fmt.Printf("ARDIUS-DIAG %s mediaTrackReceived: mid OK trackID=%s ssrc=%d mid=%s\n",
+		time.Now().Format(time.RFC3339Nano), track.ID(), track.SSRC(), mid)
 
 	// use existing media track to handle simulcast
 	var pubTime time.Duration

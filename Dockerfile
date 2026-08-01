@@ -23,6 +23,9 @@ WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
+# ardiustech DIAGNOSTIC ONLY: local instrumented pion/webrtc replace target —
+# go.mod's `replace` directive needs this present before `go mod download`.
+COPY vendor-fork/ vendor-fork/
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
