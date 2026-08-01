@@ -184,6 +184,69 @@ solving root cause or papering over it.
     pointer identity, and the SSRC de-dup filter's actual input/output for
     this exact trackID).
 
+19. **Mechanism fully traced to a specific code path — deepened
+    instrumentation inside `configureRTPReceivers` itself confirms it.**
+    Exact captured sequence for one failure (mid=9, a simulcast video
+    transceiver):
+    ```
+    configureRTPReceivers: transceiver mid=9 oldReceiver=0x50ed692608c0 tracks=2
+      receiverNeedsStopped=true reason="mid=9 rid=\"h\" ssrc=525456842 ...
+      found_no_match_in_incoming"
+    configureRTPReceivers: REPLACED receiver for mid=9 oldReceiver=0x50ed695f7440
+      newReceiver=0x50ed6aa8b2c0 (transceiver.setReceiver about to run)
+    configureRTPReceivers: SURVIVING (treated as NEW) tracks after filter: []
+    [...SetLocalDescription returns, startRTP runs 99µs later, all fast...]
+    [39ms later] mediaTrackReceived: EMPTY MID ssrc=525456842 transceiver=nil
+    ```
+    Three video transceivers (mid=7, 8, **and** 9) all got their receivers
+    replaced in the SAME renegotiation, all for the identical reason: their
+    simulcast `rid` ("h") "found no match in incoming" — i.e. **the SDP being
+    processed for THIS renegotiation genuinely does not declare these
+    tracks' simulcast rids at all.**
+    - **Key structural fact:** for RID-based simulcast (confirmed via the
+      `trackDetails` dumps — simulcast entries always show `ssrcs=[]
+      rids=[q h]`), the SDP has **no explicit SSRC** for these tracks at
+      all — the actual SSRC-to-rid binding only happens at the RTP layer
+      (via the `sdes:rtp-stream-id` header extension) as packets arrive, not
+      statically in the SDP text. This is why the SSRC-based de-dup filter
+      (`filterTrackWithSSRC`) can never protect a simulcast track — it only
+      ever sees non-simulcast (empty-rid) entries.
+    - **`runIfNewReceiver`** (the function backing BOTH `configureReceiver`
+      and `startReceiver` dispatch) matches purely by **mid** + kind +
+      direction + `!receiver.haveReceived()` — it does NOT check ssrc/rid at
+      all. Confirms the newly-replaced receiver (0x50ed6aa8b2c0) SHOULD be
+      the one correctly selected and started, IF the current renegotiation's
+      SDP had re-declared this mid's tracks. It didn't (see above), so
+      neither `configureReceiver` nor `startReceiver` ever ran for it via
+      the normal path — `SURVIVING...: []` (empty) directly confirms this.
+    - **The browser's underlying media pipeline never actually stopped
+      sending on the old SSRC** (its own local encoder for that simulcast
+      layer keeps running independent of what the SDP declares at any given
+      renegotiation instant) — so RTP for `ssrc=525456842` keeps arriving at
+      the server for a track the current SDP no longer mentions at all. That
+      orphaned RTP is what surfaces at `mediaTrackReceived` with
+      `transceiver=nil` 30-40ms later — some pion-internal fallback dispatch
+      path handles it (not `handleUndeclaredSSRC`, which explicitly declines
+      for `rid`-attributed media — traced but not the one firing here; the
+      exact fallback code path is still unidentified).
+    - **Checked whether LiveKit's own code drops the rid declarations
+      itself** (the "mungedOffer" log field name in `participant.go:1198`
+      looked suspicious) — it's just a log field name at an error site, not
+      evidence of active SDP transformation. No LiveKit-side rid-stripping
+      code found. **Not yet determined whether the browser itself
+      temporarily omits a simulcast layer's rid from a renegotiation offer
+      (e.g. bandwidth-estimation-driven layer suspension) or something else
+      entirely** — would need to capture and diff the raw SDP text of a
+      working vs. failing renegotiation to settle this definitively.
+
+**Bottom line: this is a simulcast-layer renegotiation churn bug, not a
+generic "first publish" race.** A layer's rid briefly disappears from a
+renegotiation's SDP while the browser's encoder for that layer is still
+transmitting trailing packets, and pion's receiver-replacement + fallback
+dispatch for the resulting orphaned RTP produces a transceiver-less receiver
+that LiveKit's `mediaTrackReceived` correctly (if unhelpfully) reports as
+"could not get mid for track."
+
 ## Hypotheses (unconfirmed — state confidence + what would confirm/refute)
 
 - **H5 (new, strongly supported by fact #15):** The real root cause is that

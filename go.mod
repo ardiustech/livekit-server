@@ -153,3 +153,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260724162435-b2f20204f0df // indirect
 	google.golang.org/grpc v1.82.1 // indirect
 )
+
+replace github.com/pion/webrtc/v4 => ./vendor-fork/pion-webrtc
