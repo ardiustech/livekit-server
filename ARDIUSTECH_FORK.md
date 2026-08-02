@@ -162,6 +162,27 @@ addressed):**
   the `INVESTIGATION_LOG.md` citation above now names the actual branch it
   lives on (it's diagnostic-only, never merged to `master` or this PR).
 
+**Round 3 fixes (full-panel re-review after round 2's fixes landed — verdict
+came back "Reconsider" again; 1 of 2 must-fixes addressed, see "Not yet
+done" below for the other):**
+- **MUST-FIX: a persistently-failing send could loop forever without ever
+  escalating.** Round 2's fix made `attempts` count only CONFIRMED-sent
+  nudges (correctly, to stop a transient failure from burning cap budget) —
+  but combined with the same round's unconditional re-arm, a participant
+  whose data channel NEVER opens (a persistent, not transient, failure)
+  would never advance `attempts`, and `onStuckPublishNudgeFired` would keep
+  firing every `stuckPublishNudgeGracePeriod` indefinitely, never reaching
+  `IssueFullReconnect`. Fixed with a second, independent counter — `checks`
+  — that increments on every still-stuck firing regardless of send outcome;
+  escalation now trips on `attempts >= stuckPublishNudgeMaxAttempts OR
+  checks >= stuckPublishNudgeMaxChecks` (8, deliberately looser than
+  `attempts`' 3, since this is the "give up on sending at all" backstop, not
+  the normal case). Explicitly did NOT revert to counting a failed send as
+  an attempt — that's the round-2 bug again. The decision itself is now a
+  pure function (`shouldEscalateStuckPublish`), directly unit-tested, since
+  the surrounding "still stuck" branch can't be driven end-to-end here (see
+  "Files changed" below).
+
 **Files changed:** `pkg/rtc/participant.go` (~280 lines net across both
 rounds — the pure functions `isTrackStillPending`/`buildRepublishNudgePacket`,
 the scheduling/send/dedup/cap/escalate/re-arm glue, the locked/unlocked
@@ -191,6 +212,42 @@ ship in the first place, not a newly-accepted gap).
   specifically; re-run before assuming a regression.
 
 **Not yet done (tracked as follow-ups, not blocking this patch):**
+- **Deploy prerequisite, not just a nice-to-have: `ReconnectOnPublicationError`
+  defaults to `false` upstream** (`pkg/service/roommanager.go`: "default do
+  not force full reconnect on a publication error"). Every round of this
+  patch's escalation work (round 2's gating, round 3's `checks` counter) is
+  reachable code that is a NO-OP in production unless an operator explicitly
+  sets this flag in config. Without it, a persistently-stuck track still
+  gets nudged on a bounded schedule but never actually recovers via
+  `IssueFullReconnect` — the same "stuck until an unrelated renegotiation or
+  the participant leaves" outcome the original incident had, just with more
+  logging. This must be set (`rtc.reconnect_on_publication_error: true`, or
+  the equivalent env var) as part of deploying this fork, not left at its
+  upstream default.
+- **Stale `pendingRemoteTracks` entries are a pre-existing upstream
+  bookkeeping gap, not something this patch introduced or fixes.** Round 3's
+  review flagged that an entry for a given `trackID` can in principle
+  outlive the specific `*webrtc.TrackRemote` it was created for (e.g. across
+  a republish that produces a fresh `TrackRemote` for the same `trackID`)
+  and only gets purged in bulk when `handlePendingRemoteTracks` next runs,
+  not by trackID as each one individually resolves. This predates every line
+  this patch added — `isTrackStillPending`/`onStuckPublishNudgeFired` only
+  READ `pendingRemoteTracks`, they don't own its lifecycle — so fixing it
+  means touching `mediaTrackReceived`'s/`handlePendingRemoteTracks`'s core
+  track-management logic well outside this patch's scope, with real risk of
+  destabilizing paths this patch doesn't otherwise touch. Scoped out
+  deliberately; flagging for whoever owns that code next.
+- **"Escalation sawtooth" follow-up:** `onStuckPublishNudgeFired` calls
+  `clearStuckPublishNudge` (which deletes the map entry) on cap-trip. If a
+  LATER, unrelated renegotiation re-stuck the same trackID, it would start a
+  brand-new episode at `attempts=0, checks=0` — i.e. a track that already
+  escalated once could earn a full fresh budget rather than staying
+  escalated. Suggested fix for whoever picks this up: add a terminal
+  `escalated bool` to `stuckPublishNudgeState` that's checked (and skips
+  re-arming/re-nudging) once set, rather than deleting the entry on
+  cap-trip — do not implement this as a generation/episode counter with a
+  fresh budget per renegotiation, which reintroduces the exact sawtooth this
+  is meant to close.
 - Production deploy — `infrastructure/livekit/terraform.tfvars`'s
   `livekit_image` still points at the stock `livekit/livekit-server` image.
   This fork is not live anywhere yet; deploying it is a deliberate follow-up

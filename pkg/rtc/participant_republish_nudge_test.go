@@ -280,6 +280,37 @@ func TestClearAllStuckPublishNudges_StopsEveryTimerAcrossMultipleTracks(t *testi
 // PeerConnection/ICE, so the actual SendDataMessage call is expected to
 // error here — sendRepublishNudge already handles that by logging and
 // returning, not panicking, which is exactly what this asserts.
+// TestShouldEscalateStuckPublish pins the review finding (2026-08-01 —
+// must-fix, round 3): attempts alone can never trip for a participant whose
+// sendRepublishNudge call NEVER succeeds (e.g. a data channel that never
+// opens) — attempts only increments on a CONFIRMED send (see
+// onStuckPublishNudgeFired's "peek before incrementing" fix from round 2),
+// so a persistently-failing send combined with the unconditional re-arm
+// would otherwise loop forever, never reaching IssueFullReconnect. checks
+// increments on every firing regardless of send outcome and independently
+// bounds this case. Explicitly does NOT revert to counting a failed send as
+// an attempt — that was the round-2 bug (a transient failure right after
+// join burning real retry budget).
+func TestShouldEscalateStuckPublish(t *testing.T) {
+	tests := []struct {
+		name     string
+		attempts int
+		checks   int
+		want     bool
+	}{
+		{"neither counter near its cap", 0, 0, false},
+		{"attempts reaches its cap, checks still low", stuckPublishNudgeMaxAttempts, 1, true},
+		{"attempts below cap, checks reaches its cap (persistent send failure)", 0, stuckPublishNudgeMaxChecks, true},
+		{"checks below cap and attempts below cap", stuckPublishNudgeMaxAttempts - 1, stuckPublishNudgeMaxChecks - 1, false},
+		{"checks always outpaces attempts on a persistent failure, so checks alone must trip it", 0, stuckPublishNudgeMaxChecks + 10, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, shouldEscalateStuckPublish(tt.attempts, tt.checks))
+		})
+	}
+}
+
 func TestSendRepublishNudge_DoesNotPanicWithoutLiveTransport(t *testing.T) {
 	p := newParticipantForTest("scott-identity")
 	require.NotPanics(t, func() {

@@ -2439,6 +2439,21 @@ const stuckPublishNudgeGracePeriod = 750 * time.Millisecond
 // it doesn't depend on the same client cooperating correctly again.
 const stuckPublishNudgeMaxAttempts = 3
 
+// stuckPublishNudgeMaxChecks bounds a DIFFERENT failure mode than
+// stuckPublishNudgeMaxAttempts (review finding, 2026-08-01 — must-fix):
+// attempts only counts CONFIRMED-SENT nudges, so a participant whose data
+// channel never opens (a persistent, not transient, send failure) never
+// advances attempts and — combined with onStuckPublishNudgeFired's
+// unconditional re-arm — would otherwise loop at stuckPublishNudgeGracePeriod
+// forever, never escalating. checks counts every firing regardless of send
+// outcome, so this path still terminates even when sendRepublishNudge never
+// once succeeds. Deliberately larger than stuckPublishNudgeMaxAttempts (this
+// is the "give up on sending entirely" backstop, not the normal case) — do
+// not collapse the two counters back into one; that was the prior bug this
+// replaces (a failed send counting toward the same budget as a confirmed
+// one).
+const stuckPublishNudgeMaxChecks = 8
+
 // stuckPublishNudgeState is the per-trackID bookkeeping scheduleStuckPublishNudge
 // needs to dedup and cap nudges — guarded by pendingTracksLock (see that
 // field's doc comment on the ParticipantImpl struct).
@@ -2458,6 +2473,10 @@ type stuckPublishNudgeState struct {
 	// attempt) — with max=3, that's 3 nudges sent, then reconnect on the 4th
 	// still-stuck firing, not literally "after 3 seconds."
 	attempts int
+	// checks counts every still-pending firing of onStuckPublishNudgeFired,
+	// regardless of whether sendRepublishNudge succeeded — see
+	// stuckPublishNudgeMaxChecks for why this exists alongside attempts.
+	checks int
 }
 
 // scheduleStuckPublishNudge is safe to call repeatedly for the SAME trackID
@@ -2481,6 +2500,21 @@ func (p *ParticipantImpl) scheduleStuckPublishNudge(trackID string) {
 	state.timer = time.AfterFunc(stuckPublishNudgeGracePeriod, func() {
 		p.onStuckPublishNudgeFired(trackID)
 	})
+}
+
+// shouldEscalateStuckPublish is the escalation decision pulled into its own
+// pure function (review finding, 2026-08-01) so a test can drive it directly
+// — the "still stuck" branch of onStuckPublishNudgeFired itself can't be
+// exercised end-to-end in this test binary (isTrackStillPending needs a real
+// *webrtc.TrackRemote in pendingRemoteTracks, which isn't fabricable here;
+// see participant_republish_nudge_test.go). Escalates on EITHER counter
+// reaching its cap: attempts bounds genuine confirmed-sent retries, checks
+// independently bounds the case where sendRepublishNudge never once
+// succeeds (a persistent, not transient, send failure) — see
+// stuckPublishNudgeMaxChecks's doc comment for why a failed send must still
+// count toward SOME cap even though it doesn't count toward attempts.
+func shouldEscalateStuckPublish(attemptsSoFar, checksSoFar int) bool {
+	return attemptsSoFar >= stuckPublishNudgeMaxAttempts || checksSoFar >= stuckPublishNudgeMaxChecks
 }
 
 // onStuckPublishNudgeFired is scheduleStuckPublishNudge's timer callback,
@@ -2508,11 +2542,13 @@ func (p *ParticipantImpl) onStuckPublishNudgeFired(trackID string) {
 	// condition, not evidence the track is actually stuck) still burned a
 	// slot toward the escalation cap. Only a CONFIRMED-sent attempt should
 	// count; see below.
-	var attemptsSoFar int
+	var attemptsSoFar, checksSoFar int
 	if state, ok := p.stuckPublishNudges[trackID]; ok {
 		if stillPending {
 			state.timer = nil // this firing is done; a later schedule call may arm a fresh one
+			state.checks++
 			attemptsSoFar = state.attempts
+			checksSoFar = state.checks
 		} else {
 			// Belt-and-suspenders (review finding, 2026-08-01): the NORMAL
 			// path here is that mediaTrackReceived's success path already
@@ -2530,7 +2566,7 @@ func (p *ParticipantImpl) onStuckPublishNudgeFired(trackID string) {
 		// in the interim — nothing to do.
 		return
 	}
-	if attemptsSoFar >= stuckPublishNudgeMaxAttempts {
+	if shouldEscalateStuckPublish(attemptsSoFar, checksSoFar) {
 		p.clearStuckPublishNudge(trackID)
 		// Gated behind the SAME operator control onPublicationError already
 		// uses (review finding, 2026-08-01) — escalating unconditionally
@@ -2543,7 +2579,7 @@ func (p *ParticipantImpl) onStuckPublishNudgeFired(trackID string) {
 		if p.params.ReconnectOnPublicationError {
 			p.pubLogger.Warnw(
 				"stuck-track republish nudge exhausted retries, issuing full reconnect", nil,
-				"trackID", trackID, "attempts", attemptsSoFar,
+				"trackID", trackID, "attempts", attemptsSoFar, "checks", checksSoFar,
 			)
 			p.IssueFullReconnect(types.ParticipantCloseReasonPublicationError)
 		} else {
@@ -2551,7 +2587,7 @@ func (p *ParticipantImpl) onStuckPublishNudgeFired(trackID string) {
 				"stuck-track republish nudge exhausted retries; NOT issuing a full reconnect "+
 					"(ReconnectOnPublicationError is disabled) — track will remain stuck until an "+
 					"unrelated renegotiation or the participant leaves", nil,
-				"trackID", trackID, "attempts", attemptsSoFar,
+				"trackID", trackID, "attempts", attemptsSoFar, "checks", checksSoFar,
 			)
 		}
 		return
