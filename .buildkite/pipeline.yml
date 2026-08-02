@@ -1,0 +1,141 @@
+# Buildkite CI/CD for the ardiustech/livekit-server fork (pipeline slug:
+# tax-credits-livekit-server). Mirrors ardiustech/watercooler's own
+# .buildkite/pipeline.yml structure (CI -> wait -> gated CD via SSM) — see that
+# repo's .buildkite/README.md for the shared conventions (secret storage,
+# soft-skip-until-activated pattern, etc.).
+#
+# This repo had NO CI/CD at all before this: the inherited upstream
+# .github/workflows/buildtest.yaml exists but isn't wired in as a required
+# check (flagged in PR #1's third adversarial-review round), and deploy was a
+# fully manual SSM runbook (see ardiustech/watercooler's
+# infrastructure/livekit/README.md, "Rolling the LiveKit version" section,
+# pre-this-pipeline).
+#
+# To wire this up, the Buildkite pipeline's initial step should be
+# `buildkite-agent pipeline upload`, which reads this file. See .buildkite/README.md.
+
+agents:
+  queue: default_stable
+
+steps:
+  - label: ":golang: build · vet · test"
+    if: build.source != "schedule"
+    timeout_in_minutes: 15
+    command:
+      # gofmt only the files THIS PR/commit actually touches, not the whole
+      # tree (review finding, 2026-08-02: gate-the-whole-repo would have
+      # forced reformatting pre-existing upstream files unrelated to this
+      # change, working against this fork's own low-diff-vs-upstream sync
+      # strategy — see ARDIUSTECH_FORK.md). Outside a PR context (e.g. a
+      # direct push to master), diffs against this push's own parent commit
+      # rather than origin/master, which by build time already IS the commit
+      # being built (review finding, 2026-08-02: diffing against origin/$base
+      # unconditionally made this check silently no-op on every master push).
+      # Also no-ops cleanly if a build ever has zero .go changes (empty xargs
+      # input is not an error, and bare `gofmt` is never invoked with no
+      # args, so it can't block reading stdin — a real gap in the previous
+      # version of this check).
+      - |
+        set -o pipefail
+        base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
+        if [ -n "$base" ]; then
+          git fetch --quiet origin "$base"
+          diff_range="origin/$base...HEAD"
+        else
+          # Direct push (e.g. master): by the time this runs, origin/master IS
+          # this commit, so diffing against it is always empty (review
+          # finding, 2026-08-02). Diff against this push's own parent instead.
+          # Fetch it explicitly in case the agent's clone is shallow; if the
+          # parent still can't be resolved (e.g. the very first commit ever),
+          # skip the check rather than fail the build on an unrelated
+          # shallow-clone gap.
+          git fetch --quiet --depth=2 origin "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true
+          if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+            diff_range="HEAD^..HEAD"
+          else
+            diff_range=""
+          fi
+        fi
+        if [ -n "$diff_range" ]; then
+          changed_go_files="$(git diff --name-only --diff-filter=ACM "$diff_range" -- '*.go')"
+        else
+          changed_go_files=""
+        fi
+        if [ -n "$changed_go_files" ]; then
+          fmt_out="$(echo "$changed_go_files" | xargs gofmt -l)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt would reformat:" >&2
+            echo "$fmt_out" >&2
+            exit 1
+          fi
+        fi
+      # Some tests (pkg/rtc/test's multi-node/agent cases) need a real Redis
+      # at localhost:6379, matching what the inherited upstream buildtest.yaml
+      # already provides via a GitHub Actions service container (confirmed
+      # live, build #2, 2026-08-02: TestAgentMultiNode panics with "unable to
+      # connect to redis" without one — my own earlier local `go test ./...`
+      # runs silently passed only because a redis-server happens to already
+      # be running on that machine, masking this everywhere except an actual
+      # clean CI run). Tried a docker-compose sidecar first (build #3) but
+      # docker-compose-buildkite-plugin doesn't correctly bind-mount the
+      # checkout the way docker#v5.13.0 does ("not a git repository" / "does
+      # not contain main module") AND warns it doesn't properly support
+      # step-level array commands — reverted rather than fight both issues.
+      # Installing redis INSIDE the same container as a background process is
+      # simpler: no cross-container networking or mount semantics to get
+      # right, and localhost:6379 trivially resolves since it's the same
+      # container's own loopback.
+      - apt-get update -qq && apt-get install -qq -y redis-server >/dev/null
+      - redis-server --daemonize yes
+      - go build ./...
+      - go vet ./...
+      - go test -race ./...
+    plugins:
+      - docker#v5.13.0:
+          image: "golang:1.26"
+          environment:
+            - "CI=true"
+            # -buildvcs=false (confirmed live, build #1, 2026-08-02): the
+            # docker plugin's mounted checkout is owned by a different UID
+            # than the container's user, tripping git's "dubious ownership"
+            # safety check — go build's automatic VCS stamping then fails
+            # outright ("error obtaining VCS status: exit status 128"),
+            # taking the whole step down with it. The stamped info isn't used
+            # anyway (ECR images are already tagged by commit SHA via
+            # BUILDKITE_COMMIT), so disabling it is simpler and more robust
+            # than fighting git ownership inside the container.
+            - "GOFLAGS=-mod=mod -buildvcs=false"
+
+  # Gate the deploy on the checks above passing.
+  - wait
+
+  # CD: only on master (this repo's default branch — NOT "main", unlike
+  # watercooler). Builds + pushes an amd64 image (the LiveKit box is a c6i
+  # x86_64 instance, unlike the app's arm64 t4g — see
+  # ardiustech/watercooler's infrastructure/livekit/README.md "Notes / decisions")
+  # and triggers the on-box graceful deploy via SSM. Runs on the agent's Docker
+  # (needs buildx), not the docker plugin. Requires
+  # LK_AWS_ACCESS_KEY_ID / LK_AWS_SECRET_ACCESS_KEY secrets (the
+  # watercooler-livekit-ci IAM user) — named LK_* to avoid clashing with the
+  # agent's existing AWS_* creds or watercooler's own WC_* creds (this is a
+  # DIFFERENT IAM user, scoped to the livekit-server ECR repo + the livekit
+  # instance only). See .buildkite/README.md.
+  - label: ":rocket: deploy (graceful drain)"
+    if: build.branch == "master" && build.source != "schedule"
+    command: .buildkite/steps/deploy.sh
+    timeout_in_minutes: 25
+    # Only ONE deploy against this single-node box at a time (review finding,
+    # 2026-08-02) — two overlapping deploys would race on the same
+    # docker-compose.yaml/.env and could double-prune a concurrently-pulling
+    # image.
+    concurrency: 1
+    concurrency_group: "livekit-server/deploy"
+    # Deliberately NOT auto-retried (review finding, 2026-08-02): this step is
+    # only "idempotent" up to the point it calls `ssm send-command` — after
+    # that, a blanket retry on ANY failure (including the poll step simply
+    # timing out while the box is still legitimately mid-graceful-drain) can
+    # fire a SECOND live SSM command against the same box while the first is
+    # still running, racing on the same docker-compose.yaml/.env. A transient
+    # build/push failure (the actually-safe-to-retry case) should be re-run
+    # manually after confirming via `.buildkite/steps/deploy.sh`'s own SSM
+    # command id whether a deploy is already in flight.
