@@ -272,14 +272,6 @@ func TestClearAllStuckPublishNudges_StopsEveryTimerAcrossMultipleTracks(t *testi
 	require.Empty(t, p.stuckPublishNudges)
 }
 
-// TestSendRepublishNudge_DoesNotPanicWithoutLiveTransport covers the "still
-// stuck, nudge actually attempted" path directly (rather than through
-// scheduleStuckPublishNudge's timer, which would need a real, populated
-// pendingRemoteTracks entry — not constructible in a unit test; see above).
-// newParticipantForTest builds a real TransportManager with no live
-// PeerConnection/ICE, so the actual SendDataMessage call is expected to
-// error here — sendRepublishNudge already handles that by logging and
-// returning, not panicking, which is exactly what this asserts.
 // TestShouldEscalateStuckPublish pins the review finding (2026-08-01 —
 // must-fix, round 3): attempts alone can never trip for a participant whose
 // sendRepublishNudge call NEVER succeeds (e.g. a data channel that never
@@ -311,6 +303,14 @@ func TestShouldEscalateStuckPublish(t *testing.T) {
 	}
 }
 
+// TestSendRepublishNudge_DoesNotPanicWithoutLiveTransport covers the "still
+// stuck, nudge actually attempted" path directly (rather than through
+// scheduleStuckPublishNudge's timer, which would need a real, populated
+// pendingRemoteTracks entry — not constructible in a unit test; see above).
+// newParticipantForTest builds a real TransportManager with no live
+// PeerConnection/ICE, so the actual SendDataMessage call is expected to
+// error here — sendRepublishNudge already handles that by logging and
+// returning, not panicking, which is exactly what this asserts.
 func TestSendRepublishNudge_DoesNotPanicWithoutLiveTransport(t *testing.T) {
 	p := newParticipantForTest("scott-identity")
 	require.NotPanics(t, func() {

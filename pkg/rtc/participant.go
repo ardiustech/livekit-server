@@ -2486,13 +2486,24 @@ type stuckPublishNudgeState struct {
 // dedup was missing entirely, so every retry of a still-stuck track armed
 // its own timer with no cap — see stuckPublishNudgeMaxAttempts for the other
 // half of that fix).
+//
+// Guarded by the same IsClosed()/IsDisconnected() check onStuckPublishNudgeFired
+// uses at its own entry (review finding, 2026-08-02): onStuckPublishNudgeFired's
+// tail re-arms via this method without rechecking those flags, so without a
+// guard here too, a Close() racing in between that firing's initial check and
+// its re-arm could re-populate stuckPublishNudges with a fresh timer AFTER
+// clearAllStuckPublishNudges() already ran for this participant — defeating
+// the Close()-time cleanup guarantee clearAllStuckPublishNudges was added for.
 func (p *ParticipantImpl) scheduleStuckPublishNudge(trackID string) {
-	p.pendingTracksLock.Lock()
-	defer p.pendingTracksLock.Unlock()
-	if state, ok := p.stuckPublishNudges[trackID]; ok && state.timer != nil {
+	if p.IsClosed() || p.IsDisconnected() {
 		return
 	}
+	p.pendingTracksLock.Lock()
+	defer p.pendingTracksLock.Unlock()
 	state, ok := p.stuckPublishNudges[trackID]
+	if ok && state.timer != nil {
+		return
+	}
 	if !ok {
 		state = &stuckPublishNudgeState{}
 		p.stuckPublishNudges[trackID] = state
