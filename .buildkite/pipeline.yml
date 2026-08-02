@@ -26,17 +26,41 @@ steps:
       # tree (review finding, 2026-08-02: gate-the-whole-repo would have
       # forced reformatting pre-existing upstream files unrelated to this
       # change, working against this fork's own low-diff-vs-upstream sync
-      # strategy — see ARDIUSTECH_FORK.md). Falls back to `master` as the
-      # diff base outside a PR context (e.g. a direct push), and no-ops
-      # cleanly if a build ever has zero .go changes (empty xargs input is
-      # not an error, and bare `gofmt` is never invoked with no args, so it
-      # can't block reading stdin — a real gap in the previous version of
-      # this check).
+      # strategy — see ARDIUSTECH_FORK.md). Outside a PR context (e.g. a
+      # direct push to master), diffs against this push's own parent commit
+      # rather than origin/master, which by build time already IS the commit
+      # being built (review finding, 2026-08-02: diffing against origin/$base
+      # unconditionally made this check silently no-op on every master push).
+      # Also no-ops cleanly if a build ever has zero .go changes (empty xargs
+      # input is not an error, and bare `gofmt` is never invoked with no
+      # args, so it can't block reading stdin — a real gap in the previous
+      # version of this check).
       - |
         set -o pipefail
-        base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-master}"
-        git fetch --quiet origin "$base"
-        changed_go_files="$(git diff --name-only --diff-filter=ACM "origin/$base...HEAD" -- '*.go')"
+        base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
+        if [ -n "$base" ]; then
+          git fetch --quiet origin "$base"
+          diff_range="origin/$base...HEAD"
+        else
+          # Direct push (e.g. master): by the time this runs, origin/master IS
+          # this commit, so diffing against it is always empty (review
+          # finding, 2026-08-02). Diff against this push's own parent instead.
+          # Fetch it explicitly in case the agent's clone is shallow; if the
+          # parent still can't be resolved (e.g. the very first commit ever),
+          # skip the check rather than fail the build on an unrelated
+          # shallow-clone gap.
+          git fetch --quiet --depth=2 origin "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true
+          if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+            diff_range="HEAD^..HEAD"
+          else
+            diff_range=""
+          fi
+        fi
+        if [ -n "$diff_range" ]; then
+          changed_go_files="$(git diff --name-only --diff-filter=ACM "$diff_range" -- '*.go')"
+        else
+          changed_go_files=""
+        fi
         if [ -n "$changed_go_files" ]; then
           fmt_out="$(echo "$changed_go_files" | xargs gofmt -l)"
           if [ -n "$fmt_out" ]; then

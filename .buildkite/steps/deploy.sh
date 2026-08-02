@@ -99,6 +99,15 @@ docker buildx build --platform linux/amd64 \
 # manually re-running a build after a spurious failure is the same risk as an
 # automatic retry would have been). SSM's own command history is the source
 # of truth, not any state this script keeps locally.
+#
+# Filters by DocumentName only, not by target instance (`aws ssm list-commands
+# --filters` has no instance/tag key to filter on). Equivalent to scoping by
+# instance today since DEPLOY_DOCUMENT/INSTANCE_TAG both default to the single
+# prod box (review finding, 2026-08-02) — if this document is ever reused
+# against a second target (e.g. staging), this check would need to resolve
+# INSTANCE_TAG to an instance ID and cross-check
+# list-command-invocations --instance-id instead, or it will block a
+# legitimate deploy to instance B just because instance A has one in flight.
 echo "--- :mag: checking for an in-flight deploy"
 IN_FLIGHT="$(awscli ssm list-commands \
   --filters "key=DocumentName,value=$DEPLOY_DOCUMENT" \
@@ -122,11 +131,16 @@ echo "command id: $CMD_ID"
 # Fail fast if the command matched zero instances (a stale/wrong
 # INSTANCE_NAME_TAG) rather than silently polling all the way to the generic
 # timeout, which reads identically to a real in-progress deploy (review
-# finding, 2026-08-02). SSM registers invocations against matched instances
-# within a few seconds of send-command, well inside this first short wait.
-sleep 10
-MATCHED="$(awscli ssm list-command-invocations --command-id "$CMD_ID" \
-  --query 'length(CommandInvocations)' --output text 2>/dev/null || echo 0)"
+# finding, 2026-08-02). Retries a few times (review finding, 2026-08-02: a
+# single fixed 10s delay could false-negative under load if SSM registration
+# lags past it) before concluding zero instances actually matched.
+MATCHED=0
+for _ in 1 2 3; do
+  sleep 5
+  MATCHED="$(awscli ssm list-command-invocations --command-id "$CMD_ID" \
+    --query 'length(CommandInvocations)' --output text 2>/dev/null || echo 0)"
+  [ "$MATCHED" != "0" ] && break
+done
 if [ "$MATCHED" = "0" ]; then
   echo "+++ :x: SSM command matched zero instances for tag:Name=$INSTANCE_TAG — check INSTANCE_NAME_TAG" >&2
   exit 1
