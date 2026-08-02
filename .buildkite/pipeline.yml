@@ -77,7 +77,17 @@ steps:
           image: "golang:1.26"
           environment:
             - "CI=true"
-            - "GOFLAGS=-mod=mod"
+            # -buildvcs=false (confirmed live, first real pipeline run,
+            # 2026-08-02): the docker plugin's mounted checkout is owned by a
+            # different UID than the container's user, tripping git's
+            # "dubious ownership" safety check — `go build`'s automatic VCS
+            # stamping then fails outright ("error obtaining VCS status: exit
+            # status 128"), taking the whole step down with it. The stamped
+            # info isn't used anyway (ECR images are already tagged by commit
+            # SHA via BUILDKITE_COMMIT), so disabling it is simpler and more
+            # robust than fighting git ownership inside the container with a
+            # `safe.directory` config step.
+            - "GOFLAGS=-mod=mod -buildvcs=false"
 
   # Gate the deploy on the checks above passing.
   - wait
