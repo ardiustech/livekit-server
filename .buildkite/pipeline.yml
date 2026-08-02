@@ -46,26 +46,35 @@ steps:
       # different UID than the container's user — should have been here from
       # build #1 instead of only patching the Go-internal symptom.
       - git config --global --add safe.directory '*'
+      # No `git fetch` here (confirmed live, build #8, 2026-08-02): the
+      # container has no known_hosts entry for github.com, so a fetch over
+      # the origin remote's ssh:// URL hangs forever on an interactive
+      # "are you sure you want to continue connecting" host-key prompt —
+      # with no TTY in CI, that's an unrecoverable hang, not a fast failure.
+      # Not needed anyway: Buildkite's own agent-level checkout (which DOES
+      # have a trusted, working git/ssh setup) already fetched everything
+      # this needs — origin/<base> for a PR, and enough history for HEAD^ on
+      # a direct push — before this container ever started. Relies entirely
+      # on refs already present locally; the `git rev-parse --verify --quiet`
+      # check below still skips cleanly (not a hard failure) if a ref
+      # somehow isn't there (e.g. an unusually shallow agent clone).
       - |
         set -o pipefail
         base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
-        if [ -n "$base" ]; then
-          git fetch --quiet origin "$base"
+        if [ -n "$base" ] && git rev-parse --verify --quiet "origin/$base" >/dev/null; then
           diff_range="origin/$base...HEAD"
+        elif git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+          # Direct push (e.g. master), or a PR base ref that isn't locally
+          # resolvable for some reason: by the time this runs, origin/master
+          # IS this commit, so diffing against it is always empty (review
+          # finding, 2026-08-02) — diff against this push's own parent
+          # instead.
+          diff_range="HEAD^..HEAD"
         else
-          # Direct push (e.g. master): by the time this runs, origin/master IS
-          # this commit, so diffing against it is always empty (review
-          # finding, 2026-08-02). Diff against this push's own parent instead.
-          # Fetch it explicitly in case the agent's clone is shallow; if the
-          # parent still can't be resolved (e.g. the very first commit ever),
-          # skip the check rather than fail the build on an unrelated
-          # shallow-clone gap.
-          git fetch --quiet --depth=2 origin "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true
-          if git rev-parse --verify --quiet "HEAD^" >/dev/null; then
-            diff_range="HEAD^..HEAD"
-          else
-            diff_range=""
-          fi
+          # Neither ref resolvable (e.g. the very first commit ever, or an
+          # unusually shallow clone) — skip the check rather than fail the
+          # build on an unrelated gap.
+          diff_range=""
         fi
         if [ -n "$diff_range" ]; then
           changed_go_files="$(git diff --name-only --diff-filter=ACM "$diff_range" -- '*.go')"
