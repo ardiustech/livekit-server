@@ -16,8 +16,10 @@ version of "Rolling the LiveKit version").
 
 | Step | Image | Does |
 |---|---|---|
-| build · vet · test | `golang:1.26` | `gofmt -l` (fails on any diff), `go build ./...`, `go vet ./...`, `go test ./...` |
+| build · vet · test | `golang:1.26` + a `redis:6` sidecar (`.buildkite/docker-compose.ci.yml`) | `gofmt -l` (only files this PR/commit touches), `go build ./...`, `go vet ./...`, `go test -race ./...` |
 | deploy (graceful drain) | agent Docker | **master only**, after the above pass: build+push amd64 image, trigger on-box graceful-drain deploy via SSM |
+
+**Why a Redis sidecar:** some tests (`pkg/rtc/test`'s multi-node/agent cases) need a real Redis at `localhost:6379` — the same dependency the inherited upstream `buildtest.yaml` already provides via a GitHub Actions service container. Confirmed live on this pipeline's first real run (build #2): `TestAgentMultiNode` panics with "unable to connect to redis" without one. Uses `network_mode: "service:redis"` (not the default bridge network) so `localhost:6379` inside the `golang` container actually reaches it — the tests hardcode that address, not a service-name hostname.
 
 The verify step needs no credentials. The deploy step (`.buildkite/steps/deploy.sh`)
 needs the CI AWS keys as **`LK_AWS_*`** secrets (below); without them it

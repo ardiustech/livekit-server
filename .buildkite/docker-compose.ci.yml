@@ -1,0 +1,28 @@
+# Redis sidecar for CI — some tests (pkg/rtc/test's multi-node/agent cases)
+# need a real Redis at localhost:6379, matching what the inherited upstream
+# .github/workflows/buildtest.yaml already provides via a service container
+# (confirmed live, build #2 on tax-credits-livekit-server, 2026-08-02:
+# TestAgentMultiNode panics with "unable to connect to redis" without one —
+# my own earlier local `go test ./...` runs silently passed only because a
+# redis-server happens to already be running on that machine, which masked
+# this in every check before the pipeline actually ran for real).
+#
+# `network_mode: "service:redis"` (not the default bridge network) so the
+# golang container shares redis's network NAMESPACE — the tests hardcode
+# "localhost:6379", not a service-name hostname, so this is what makes that
+# actually resolve rather than switching every test to a different address.
+services:
+  redis:
+    image: redis:6
+
+  golang:
+    image: golang:1.26
+    network_mode: "service:redis"
+    working_dir: /workdir
+    volumes:
+      - .:/workdir
+    environment:
+      - CI=true
+      - GOFLAGS=-mod=mod -buildvcs=false
+    depends_on:
+      - redis
