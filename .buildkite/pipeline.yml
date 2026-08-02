@@ -35,6 +35,17 @@ steps:
       # input is not an error, and bare `gofmt` is never invoked with no
       # args, so it can't block reading stdin — a real gap in the previous
       # version of this check).
+      # Fixes git ownership at the root, not just Go's own symptom of it
+      # (confirmed live, build #7, 2026-08-02): GOFLAGS=-buildvcs=false below
+      # only suppresses `go build`'s OWN internal git-based VCS stamping — it
+      # does nothing for the explicit `git fetch`/`git diff`/`git rev-parse`
+      # calls in the gofmt-diff script right below, which hit the exact same
+      # "dubious ownership" wall on their own and failed the whole build on
+      # this pipeline's first real production-deploy attempt. This is the
+      # standard, root-cause fix for a docker-mounted checkout owned by a
+      # different UID than the container's user — should have been here from
+      # build #1 instead of only patching the Go-internal symptom.
+      - git config --global --add safe.directory '*'
       - |
         set -o pipefail
         base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
@@ -136,8 +147,11 @@ steps:
             # outright ("error obtaining VCS status: exit status 128"),
             # taking the whole step down with it. The stamped info isn't used
             # anyway (ECR images are already tagged by commit SHA via
-            # BUILDKITE_COMMIT), so disabling it is simpler and more robust
-            # than fighting git ownership inside the container.
+            # BUILDKITE_COMMIT). Kept as belt-and-suspenders alongside the
+            # `git config --global --add safe.directory '*'` command above
+            # (the actual root-cause fix, added after build #7 — this env var
+            # alone only covers go build's OWN internal git usage, not the
+            # explicit git commands in the gofmt-diff script).
             - "GOFLAGS=-mod=mod -buildvcs=false"
 
   # Gate the deploy on the checks above passing.
