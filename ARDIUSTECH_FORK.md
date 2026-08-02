@@ -51,14 +51,16 @@ PR #162) listens for `RoomEvent.DataReceived` with topic
 (`republishOneTrack`, unpublish+publish of that single track) — NOT
 `republishAllTracks()`. That app's OWN client-side blind timer (which DID
 call `republishAllTracks()` on a fixed schedule) has since been deleted
-entirely: live A/B/C instrumentation (`ardiustech/livekit-server`
-INVESTIGATION_LOG.md facts #20-22, run against a diagnostic build of THIS
-fork) proved that blind timer was the DOMINANT source of the exact
-"could not get mid for track" collateral damage this whole effort exists to
-fix, not a mitigation for it. This reactive, server-signaled nudge is now
-the ONLY republish-nudge mechanism on the client — which is why the
-dedup/cap/escalation fix below matters: there's no other backstop left if
-this one runs away.
+entirely: live A/B/C instrumentation (`INVESTIGATION_LOG.md` facts #20-22 on
+this repo's [`experiment/mid-resolution-timing`](https://github.com/ardiustech/livekit-server/tree/experiment/mid-resolution-timing)
+branch — a diagnostic-only branch, not merged to `master` or this PR's
+branch, so that file won't appear in a plain checkout of `feat/publish-mid-stuck-nudge`;
+follow the link) proved that blind timer was the DOMINANT source of the
+exact "could not get mid for track" collateral damage this whole effort
+exists to fix, not a mitigation for it. This reactive, server-signaled
+nudge is now the ONLY republish-nudge mechanism on the client — which is
+why the dedup/cap/escalation fix below matters: there's no other backstop
+left if this one runs away.
 
 **Fixed since first opened (review round, 2026-08-01 — see PR #1 comments):**
 - **No de-dup/cap on the nudge timer (was a must-fix).** Every retry of a
@@ -94,22 +96,91 @@ this one runs away.
   SDP/`MediaStreamTrack` id. Switched to `encoding/json.Marshal` on a typed
   `republishNudgePayload` struct.
 
-**Files changed:** `pkg/rtc/participant.go` (~200 lines net — the pure
-functions `isTrackStillPending`/`buildRepublishNudgePacket`, the
-scheduling/send/dedup/cap/escalate glue, and the relay-path hard-drop),
+**Round 2 fixes (full-panel re-review after round 1's fixes landed —
+verdict came back "Reconsider," not "ship-with-changes"; all 5 must-fixes
+addressed):**
+- **MUST-FIX, most severe: a guaranteed self-deadlock on the NORMAL
+  (non-stuck) publish path.** `mediaTrackReceived` acquires
+  `pendingTracksLock` at entry and only unlocks it inside the `mid==""`
+  branch — so the mid-RESOLVED success path (added in round 1) that called
+  the LOCKING `clearStuckPublishNudge` was calling `Lock()` on an
+  already-held, non-reentrant `utils.RWMutex`. Every track whose `mid`
+  resolved on the first try (the overwhelmingly common case) would hang the
+  calling goroutine forever, wedging every other operation on that
+  participant needing the same lock. Missed in round 1 because a real
+  `*webrtc.TrackRemote` can't be constructed in this test suite, so
+  `mediaTrackReceived`'s actual runtime path was never unit-exercised. Fixed
+  by splitting into `clearStuckPublishNudge` (locking, for external callers)
+  and `clearStuckPublishNudgeLocked` (for callers already holding the lock);
+  regression test uses a goroutine + timeout to detect a re-introduced
+  deadlock without hanging the test suite itself if it recurs.
+- **MUST-FIX: escalation was unreachable in the exact scenario this patch
+  targets.** `scheduleStuckPublishNudge` is only called from
+  `mediaTrackReceived`'s `mid==""` branch, which only fires again on an
+  UNRELATED renegotiation. In a "publish once, then nothing" app (this
+  fork's own stated target case), one nudge fired at t=750ms and `attempts`
+  froze at 1 forever — no further nudges, no escalation, regardless of
+  whether the client ever acted on it. `onStuckPublishNudgeFired` now
+  re-arms itself (`p.scheduleStuckPublishNudge(trackID)`) after every
+  still-stuck firing, making the check self-sustaining until the track
+  resolves or the cap trips.
+- **MUST-FIX: escalation bypassed an existing operator control on an
+  untuned timeline.** `IssueFullReconnect` fired unconditionally once the
+  cap tripped (~3s), for a strictly larger set of cases than the one
+  incident this targets (a merely-slow client, not just a pathologically
+  stuck one) — and the incident this cites ran 2 MINUTES with ordinary
+  renegotiations already failing to help, so ~3s is unvalidated against the
+  fork's own evidence. Now gated behind `p.params.ReconnectOnPublicationError`,
+  the same flag `onPublicationError` already uses elsewhere in this file;
+  logs clearly either way.
+- **MUST-FIX: a failed nudge SEND still counted toward the escalation
+  cap.** `attempts` incremented unconditionally before `sendRepublishNudge`
+  even ran — a transport-level failure (data channel not yet open, e.g.
+  right after a fresh join) is not evidence the track is actually stuck,
+  but could still burn through the cap and trigger an unwarranted full
+  reconnect. `sendRepublishNudge` now returns whether the transport
+  actually accepted the message; only a confirmed-sent attempt counts.
+  Still re-arms on failure either way, so a transient hiccup gets retried
+  next tick instead of going quiet.
+- **Should-consider, applied: the escalation cap's trackID-stability
+  assumption is real but not independently re-verified in this round.**
+  The cap only engages if the SAME `track.ID()` keeps reappearing across
+  republish cycles — if `republishOneTrack`'s unpublish+publish somehow
+  produced a fresh id each time, the cap would silently never trip. Per
+  earlier investigation (`ardiustech/watercooler`'s `findLocalTrackById` doc
+  comment, cross-checked against this fork's own `getPublishedTrackBySdpCid`
+  lookup and the client SDK's `AddTrackRequest{cid: track.mediaStreamTrack.id}`
+  construction), the id IS the client's own `cid`, which stays stable across
+  a republish because `republishOneTrack` reuses the SAME `LocalTrack`
+  instance rather than constructing a new one — so this should already hold.
+  Flagged here rather than silently assumed: this specific claim has NOT
+  been independently re-verified end-to-end in this round (the same
+  `*webrtc.TrackRemote`-construction limitation applies), so treat it as
+  well-evidenced, not proven, until a live multi-nudge repro confirms it.
+- Also applied two nice-to-haves: `stuckPublishNudges` entries are now
+  explicitly deleted (not just timer-nulled) on the resolved-early path, and
+  the `INVESTIGATION_LOG.md` citation above now names the actual branch it
+  lives on (it's diagnostic-only, never merged to `master` or this PR).
+
+**Files changed:** `pkg/rtc/participant.go` (~280 lines net across both
+rounds — the pure functions `isTrackStillPending`/`buildRepublishNudgePacket`,
+the scheduling/send/dedup/cap/escalate/re-arm glue, the locked/unlocked
+clear split, and the relay-path hard-drop),
 `pkg/rtc/participant_republish_nudge_test.go` (covers the pure functions
-directly, `onStuckPublishNudgeFired`'s resolved-without-sending case,
-dedup/re-arm/clear/clear-all behavior via direct state manipulation — no
-real timer waits — and a JSON-validity regression test for the control-byte
-fix; a real `*webrtc.TrackRemote` still can't be constructed in a unit test
-at all, since every field is private with no exported constructor, so the
-"still stuck, N attempts, then escalates" full integration path remains
-covered only by the pure `isTrackStillPending` decision plus manual/live
-verification, same limitation as before this round).
+directly, `onStuckPublishNudgeFired`'s resolved-without-sending/re-arming
+cases, dedup/re-arm/clear/clear-all behavior via direct state manipulation
+— no real timer waits — a goroutine+timeout deadlock regression test, and a
+JSON-validity regression test for the control-byte fix; a real
+`*webrtc.TrackRemote` still can't be constructed in a unit test at all,
+since every field is private with no exported constructor, so the "still
+stuck, N attempts, then escalates" full integration path remains covered
+only by the pure `isTrackStillPending` decision plus manual/live
+verification — this is the SAME limitation that let round 1's deadlock
+ship in the first place, not a newly-accepted gap).
 
 **Verified:**
 - `go build ./pkg/rtc/...`, `go vet ./pkg/rtc/...`, `gofmt -l` all clean.
-- New/updated tests: 9/9 pass, repeatably, no `time.Sleep`-based waits.
+- New/updated tests: 11/11 pass, repeatably, no `time.Sleep`-based waits.
 - Full `pkg/rtc` suite: passes clean on multiple runs. **Caveat:** this
   package has pre-existing flaky tests unrelated to this patch —
   `TestNegotiationFailed`, `TestFilteringCandidates`, and
@@ -132,6 +203,17 @@ verification, same limitation as before this round).
   `pendingRemoteTracks` (`ti == nil`, a related but distinct AddTrack-timing
   race) — scoped out of this first patch to stay narrowly targeted at the
   exact, confirmed, reproduced production incident.
+- A live, multi-nudge, real-negotiation repro to independently re-confirm
+  the trackID-stability assumption the escalation cap depends on (see
+  above) — real evidence exists (client-side investigation, cited), but a
+  fresh, this-mechanism-specific confirmation would close the gap fully.
+- The recovery signal still rides the same WebRTC DataChannel/negotiation
+  path this patch works around, rather than the always-up WS signaling
+  channel LiveKit's own server-push messages (RoomUpdate,
+  ConnectionQualityUpdate) already use. A stronger delivery-ack pattern
+  (`PerformRpc`'s ack/timeout, elsewhere in this file) is also still a
+  fire-and-forget-vs-confirmed-delivery gap. Both are real, scoped-out
+  hardening opportunities, not correctness bugs in what shipped.
 - Whether renegotiation-based recovery is even the right general mechanism
   is a real open question the review round raised: the incident's own 215
   failed attempts happened WHILE ordinary renegotiations were occurring, and

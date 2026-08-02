@@ -17,6 +17,7 @@ package rtc
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -107,7 +108,11 @@ func TestBuildRepublishNudgePacket_ValidJSONForControlByteTrackID(t *testing.T) 
 // pendingRemoteTracks starts empty, matching a track that was never stuck
 // (or already flushed by an unrelated renegotiation) — isTrackStillPending
 // returns false, so this must be a pure no-op: no nudge sent, no state left
-// behind.
+// behind. Asserts the entry is REMOVED entirely (round-2 fix, 2026-08-01),
+// not just left with attempts==0 — a leaked zero-value entry is still a
+// leak, and this is also belt-and-suspenders against
+// mediaTrackReceived's own clearStuckPublishNudgeLocked call not having run
+// for some reason.
 func TestOnStuckPublishNudgeFired_ResolvedClearsStateWithoutSending(t *testing.T) {
 	p := newParticipantForTest("scott-identity")
 	const trackID = "TR_will_resolve"
@@ -116,7 +121,8 @@ func TestOnStuckPublishNudgeFired_ResolvedClearsStateWithoutSending(t *testing.T
 	require.NotPanics(t, func() {
 		p.onStuckPublishNudgeFired(trackID)
 	})
-	require.Equal(t, 0, p.stuckPublishNudges[trackID].attempts, "must not count an attempt for a track that already resolved")
+	_, exists := p.stuckPublishNudges[trackID]
+	require.False(t, exists, "must remove the entry entirely for a track that already resolved, not just zero its attempts")
 }
 
 // TestScheduleStuckPublishNudge_DedupsWhileATimerIsAlreadyInFlight pins the
@@ -180,6 +186,71 @@ func TestClearStuckPublishNudge_RemovesStateAndStopsTheTimer(t *testing.T) {
 	require.Len(t, p.stuckPublishNudges, 1)
 	require.Equal(t, 0, p.stuckPublishNudges[trackID].attempts)
 	p.clearStuckPublishNudge(trackID)
+}
+
+// TestClearStuckPublishNudgeLocked_DoesNotReacquireTheLock is a regression
+// test for a real, guaranteed self-deadlock (review finding, 2026-08-01,
+// caught before this ever reached production): mediaTrackReceived's
+// mid-resolved path called the LOCKING clearStuckPublishNudge while it
+// ALREADY held pendingTracksLock (acquired at function entry, only unlocked
+// in the mid=="" branch) — utils.RWMutex is not reentrant, so this hung
+// EVERY successful (non-stuck) track publish, wedging every other operation
+// on that participant needing the same lock (AddTrack, handlePendingRemoteTracks,
+// Close). The fix splits it into a locking wrapper (clearStuckPublishNudge,
+// for callers that don't hold the lock) and clearStuckPublishNudgeLocked
+// (for callers already inside the critical section). This test simulates
+// mediaTrackReceived's exact pattern — Lock(), then clear — and would hang
+// (caught via a timeout, not an actual indefinite block) if
+// clearStuckPublishNudgeLocked ever regressed to re-acquiring the lock.
+func TestClearStuckPublishNudgeLocked_DoesNotReacquireTheLock(t *testing.T) {
+	p := newParticipantForTest("scott-identity")
+	const trackID = "TR_stuck"
+	p.scheduleStuckPublishNudge(trackID)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.pendingTracksLock.Lock() // exactly mediaTrackReceived's own entry lock
+		defer p.pendingTracksLock.Unlock()
+		p.clearStuckPublishNudgeLocked(trackID)
+	}()
+
+	select {
+	case <-done:
+		require.Empty(t, p.stuckPublishNudges)
+	case <-time.After(2 * time.Second):
+		t.Fatal(
+			"clearStuckPublishNudgeLocked deadlocked while pendingTracksLock was already held — " +
+				"this is the exact self-deadlock bug the locked/unlocked split exists to prevent",
+		)
+	}
+}
+
+// TestOnStuckPublishNudgeFired_ReArmsAfterSendingWithoutARealPendingTrack
+// covers as much of the re-arm fix (review finding, 2026-08-01 — must-fix:
+// escalation was UNREACHABLE because nothing re-scheduled after a nudge) as
+// is constructible without a real *webrtc.TrackRemote (see
+// isTrackStillPending's doc comment — pendingRemoteTracks entries can't be
+// fabricated in this test binary, so the "still stuck" branch itself can't
+// be driven end-to-end here). What IS directly testable: calling
+// scheduleStuckPublishNudge → firing it manually via onStuckPublishNudgeFired
+// with an EMPTY pendingRemoteTracks (the "resolved" branch) must NOT re-arm —
+// re-arming is conditional on stillPending, and this pins that it stays
+// conditional rather than firing unconditionally.
+func TestOnStuckPublishNudgeFired_ResolvedDoesNotReArm(t *testing.T) {
+	p := newParticipantForTest("scott-identity")
+	const trackID = "TR_will_resolve"
+	p.stuckPublishNudges[trackID] = &stuckPublishNudgeState{}
+
+	p.onStuckPublishNudgeFired(trackID)
+
+	// The entry is removed entirely on resolve (see
+	// TestOnStuckPublishNudgeFired_ResolvedClearsStateWithoutSending) — which
+	// itself is what prevents a re-arm: scheduleStuckPublishNudge's dedup
+	// check only reads state that no longer exists here.
+	state, exists := p.stuckPublishNudges[trackID]
+	require.False(t, exists, "must not re-arm for a track that already resolved")
+	require.Nil(t, state)
 }
 
 // TestClearAllStuckPublishNudges_StopsEveryTimerAcrossMultipleTracks covers
