@@ -24,6 +24,12 @@ ACCOUNT="${DEPLOY_ACCOUNT_ID:-396735084811}"
 REGION="${LK_AWS_REGION:-${LK_AWS_DEFAULT_REGION:-us-west-2}}"
 REPO="${ECR_REPO:-livekit-server}"
 INSTANCE_TAG="${INSTANCE_NAME_TAG:-watercooler-livekit-prod}"
+# The CUSTOM SSM document (ardiustech/watercooler's infrastructure/livekit/
+# ssm_document.tf), not the AWS-managed AWS-RunShellScript (review finding,
+# 2026-08-02 — see that file's doc comment: this document can only ever run
+# deploy.sh with a validated Tag, closing off the arbitrary-shell-command
+# surface the generic document would otherwise grant this CI credential).
+DEPLOY_DOCUMENT="${DEPLOY_DOCUMENT_NAME:-watercooler-livekit-deploy-prod}"
 REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
 IMAGE="$REGISTRY/$REPO"
 TAG="${BUILDKITE_COMMIT:-latest}"
@@ -95,8 +101,8 @@ docker buildx build --platform linux/amd64 \
 # of truth, not any state this script keeps locally.
 echo "--- :mag: checking for an in-flight deploy"
 IN_FLIGHT="$(awscli ssm list-commands \
-  --filters "key=DocumentName,value=AWS-RunShellScript" \
-  --query "Commands[?Status=='InProgress' || Status=='Pending'] | [?contains(Comment, 'livekit-server CD')].CommandId" \
+  --filters "key=DocumentName,value=$DEPLOY_DOCUMENT" \
+  --query "Commands[?Status=='InProgress' || Status=='Pending'].CommandId" \
   --output text 2>/dev/null || echo "")"
 if [ -n "$IN_FLIGHT" ]; then
   echo "+++ :x: a livekit-server deploy is already in flight (CommandId: $IN_FLIGHT) — refusing to send a second one" >&2
@@ -106,10 +112,10 @@ fi
 
 echo "--- :rocket: trigger graceful-drain deploy via SSM"
 CMD_ID="$(awscli ssm send-command \
-  --document-name AWS-RunShellScript \
+  --document-name "$DEPLOY_DOCUMENT" \
   --targets "Key=tag:Name,Values=$INSTANCE_TAG" \
   --comment "livekit-server CD $TAG" \
-  --parameters "commands=[\"/opt/livekit/deploy.sh $TAG\"]" \
+  --parameters "Tag=$TAG" \
   --query 'Command.CommandId' --output text)"
 echo "command id: $CMD_ID"
 
