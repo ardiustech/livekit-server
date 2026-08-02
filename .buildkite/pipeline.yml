@@ -118,7 +118,12 @@ steps:
       # daemon respectively) before shipping anything that actually touches
       # ICE/TURN/multi-node behavior or the code those tests cover — this
       # gate going green is not a substitute for that.
-      - go test -race $(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$')
+      # Fail fast if `go list` itself errors (build-cache/disk hiccup): a bare
+      # `go test -race` fallback would silently test only the cwd package and
+      # still exit 0 — the exact "silently passes" gap the gofmt check above
+      # was hardened against (review finding, 2026-08-02).
+      - |
+        pkgs=$(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$') && [ -n "$pkgs" ] && go test -race $pkgs
     plugins:
       - docker#v5.13.0:
           image: "golang:1.26"
