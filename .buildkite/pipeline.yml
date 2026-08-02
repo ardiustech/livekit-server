@@ -20,12 +20,34 @@ agents:
 steps:
   - label: ":golang: build · vet · test"
     if: build.source != "schedule"
+    timeout_in_minutes: 15
     command:
-      - "gofmt -l $(find . -name '*.go' -not -path './vendor/*') | tee /tmp/fmt.out"
-      - "test ! -s /tmp/fmt.out"
+      # gofmt only the files THIS PR/commit actually touches, not the whole
+      # tree (review finding, 2026-08-02: gate-the-whole-repo would have
+      # forced reformatting pre-existing upstream files unrelated to this
+      # change, working against this fork's own low-diff-vs-upstream sync
+      # strategy — see ARDIUSTECH_FORK.md). Falls back to `master` as the
+      # diff base outside a PR context (e.g. a direct push), and no-ops
+      # cleanly if a build ever has zero .go changes (empty xargs input is
+      # not an error, and bare `gofmt` is never invoked with no args, so it
+      # can't block reading stdin — a real gap in the previous version of
+      # this check).
+      - |
+        set -o pipefail
+        base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-master}"
+        git fetch --quiet origin "$base"
+        changed_go_files="$(git diff --name-only --diff-filter=ACM "origin/$base...HEAD" -- '*.go')"
+        if [ -n "$changed_go_files" ]; then
+          fmt_out="$(echo "$changed_go_files" | xargs gofmt -l)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt would reformat:" >&2
+            echo "$fmt_out" >&2
+            exit 1
+          fi
+        fi
       - go build ./...
       - go vet ./...
-      - go test ./...
+      - go test -race ./...
     plugins:
       - docker#v5.13.0:
           image: "golang:1.26"
@@ -50,9 +72,19 @@ steps:
   - label: ":rocket: deploy (graceful drain)"
     if: build.branch == "master" && build.source != "schedule"
     command: .buildkite/steps/deploy.sh
-    # Idempotent (always deploys the given tag fresh), so a single retry covers
-    # transient build/push/network flakiness safely.
-    retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
+    timeout_in_minutes: 25
+    # Only ONE deploy against this single-node box at a time (review finding,
+    # 2026-08-02) — two overlapping deploys would race on the same
+    # docker-compose.yaml/.env and could double-prune a concurrently-pulling
+    # image.
+    concurrency: 1
+    concurrency_group: "livekit-server/deploy"
+    # Deliberately NOT auto-retried (review finding, 2026-08-02): this step is
+    # only "idempotent" up to the point it calls `ssm send-command` — after
+    # that, a blanket retry on ANY failure (including the poll step simply
+    # timing out while the box is still legitimately mid-graceful-drain) can
+    # fire a SECOND live SSM command against the same box while the first is
+    # still running, racing on the same docker-compose.yaml/.env. A transient
+    # build/push failure (the actually-safe-to-retry case) should be re-run
+    # manually after confirming via `.buildkite/steps/deploy.sh`'s own SSM
+    # command id whether a deploy is already in flight.
