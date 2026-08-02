@@ -162,6 +162,19 @@ steps:
             # alone only covers go build's OWN internal git usage, not the
             # explicit git commands in the gofmt-diff script).
             - "GOFLAGS=-mod=mod -buildvcs=false"
+            # GOSUMDB=off (confirmed live, builds #9-12, 2026-08-02): `go mod
+            # download` was reproducibly dying ~60-65s after "downloading
+            # github.com/olekukonko/errors" — on TWO DIFFERENT agents, ruling
+            # out one bad host. Working theory: a checksum-verification call
+            # to sum.golang.org is blocked/heavily rate-limited from this
+            # network and eventually gets killed with no error output. This
+            # is a CI container building a fork we already trust (this fork's
+            # own repo, not a random dependency), so skipping the public
+            # checksum DB here is an acceptable tradeoff for actually being
+            # able to build at all — go.sum itself still pins exact versions
+            # and hashes checked against THAT file, this only skips the
+            # extra round-trip to the public transparency log.
+            - "GOSUMDB=off"
 
   # Gate the deploy on the checks above passing.
   - wait
