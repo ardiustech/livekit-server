@@ -69,25 +69,42 @@ steps:
             exit 1
           fi
         fi
+      # Some tests (pkg/rtc/test's multi-node/agent cases) need a real Redis
+      # at localhost:6379, matching what the inherited upstream buildtest.yaml
+      # already provides via a GitHub Actions service container (confirmed
+      # live, build #2, 2026-08-02: TestAgentMultiNode panics with "unable to
+      # connect to redis" without one — my own earlier local `go test ./...`
+      # runs silently passed only because a redis-server happens to already
+      # be running on that machine, masking this everywhere except an actual
+      # clean CI run). Tried a docker-compose sidecar first (build #3) but
+      # docker-compose-buildkite-plugin doesn't correctly bind-mount the
+      # checkout the way docker#v5.13.0 does ("not a git repository" / "does
+      # not contain main module") AND warns it doesn't properly support
+      # step-level array commands — reverted rather than fight both issues.
+      # Installing redis INSIDE the same container as a background process is
+      # simpler: no cross-container networking or mount semantics to get
+      # right, and localhost:6379 trivially resolves since it's the same
+      # container's own loopback.
+      - apt-get update -qq && apt-get install -qq -y redis-server >/dev/null
+      - redis-server --daemonize yes
       - go build ./...
       - go vet ./...
       - go test -race ./...
     plugins:
-      # docker-compose, not the plain docker#v5.13.0 plugin (confirmed live,
-      # build #2, 2026-08-02): some tests (pkg/rtc/test's multi-node/agent
-      # cases) need a real Redis at localhost:6379, matching what the
-      # inherited upstream buildtest.yaml already provides via a service
-      # container. See docker-compose.ci.yml for why the golang service
-      # shares redis's network namespace rather than the default bridge
-      # network. GOFLAGS=-buildvcs=false is still needed here too (confirmed
-      # live, build #1): the mounted checkout is owned by a different UID
-      # than the container's user, tripping git's "dubious ownership" check,
-      # which fails go build's automatic VCS stamping outright. The stamped
-      # info isn't used anyway — ECR images are already tagged by commit SHA
-      # via BUILDKITE_COMMIT.
-      - docker-compose#v4.14.0:
-          config: .buildkite/docker-compose.ci.yml
-          run: golang
+      - docker#v5.13.0:
+          image: "golang:1.26"
+          environment:
+            - "CI=true"
+            # -buildvcs=false (confirmed live, build #1, 2026-08-02): the
+            # docker plugin's mounted checkout is owned by a different UID
+            # than the container's user, tripping git's "dubious ownership"
+            # safety check — go build's automatic VCS stamping then fails
+            # outright ("error obtaining VCS status: exit status 128"),
+            # taking the whole step down with it. The stamped info isn't used
+            # anyway (ECR images are already tagged by commit SHA via
+            # BUILDKITE_COMMIT), so disabling it is simpler and more robust
+            # than fighting git ownership inside the container.
+            - "GOFLAGS=-mod=mod -buildvcs=false"
 
   # Gate the deploy on the checks above passing.
   - wait

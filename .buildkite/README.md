@@ -16,10 +16,12 @@ version of "Rolling the LiveKit version").
 
 | Step | Image | Does |
 |---|---|---|
-| build · vet · test | `golang:1.26` + a `redis:6` sidecar (`.buildkite/docker-compose.ci.yml`) | `gofmt -l` (only files this PR/commit touches), `go build ./...`, `go vet ./...`, `go test -race ./...` |
+| build · vet · test | `golang:1.26` (+ `redis-server` installed and started in-container) | `gofmt -l` (only files this PR/commit touches), `go build ./...`, `go vet ./...`, `go test -race ./...` |
 | deploy (graceful drain) | agent Docker | **master only**, after the above pass: build+push amd64 image, trigger on-box graceful-drain deploy via SSM |
 
-**Why a Redis sidecar:** some tests (`pkg/rtc/test`'s multi-node/agent cases) need a real Redis at `localhost:6379` — the same dependency the inherited upstream `buildtest.yaml` already provides via a GitHub Actions service container. Confirmed live on this pipeline's first real run (build #2): `TestAgentMultiNode` panics with "unable to connect to redis" without one. Uses `network_mode: "service:redis"` (not the default bridge network) so `localhost:6379` inside the `golang` container actually reaches it — the tests hardcode that address, not a service-name hostname.
+**Why Redis is here at all:** some tests (`pkg/rtc/test`'s multi-node/agent cases) need a real Redis at `localhost:6379` — the same dependency the inherited upstream `buildtest.yaml` already provides via a GitHub Actions service container. Confirmed live on this pipeline's first real runs: `TestAgentMultiNode` panics with "unable to connect to redis" without one (build #2), and my own earlier local `go test ./...` checks had silently passed only because a `redis-server` happens to already be running on that machine — masking this everywhere except an actual clean CI run.
+
+**Why in-container, not a sidecar:** tried a `docker-compose` sidecar first (build #3) — `docker-compose-buildkite-plugin` doesn't correctly bind-mount the checkout the way `docker#v5.13.0` does (`fatal: not a git repository` / `does not contain main module`) and separately warns it doesn't properly support step-level array commands. Installing `redis-server` inside the same `golang` container as a background process (`apt-get install`, then `redis-server --daemonize yes`) sidesteps both: no cross-container networking or mount semantics to get right, and `localhost:6379` trivially resolves since it's the container's own loopback.
 
 The verify step needs no credentials. The deploy step (`.buildkite/steps/deploy.sh`)
 needs the CI AWS keys as **`LK_AWS_*`** secrets (below); without them it
