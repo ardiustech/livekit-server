@@ -109,10 +109,27 @@ On a successful `test` run for a push to `master`, `buildtest.yaml`'s
 `build-and-deploy` job builds the amd64 image (tagged by commit SHA +
 `latest` — amd64 only, since the LiveKit box is a c6i x86_64 instance, not
 arm64 like the watercooler app box), pushes it to ECR, and creates a GitHub
-Deployment. Buildkite (configured to trigger off GitHub Deployments — see
-setup below) then runs the deploy step: it does **not** build or pull
-anything itself, it just triggers `/opt/livekit/deploy.sh <sha>` on the
-instance via SSM and polls for completion.
+Deployment **with an explicit `success` deployment status**. Buildkite
+(configured to trigger off GitHub Deployments — see setup below) then runs
+the deploy step: it does **not** build or pull anything itself, it just
+triggers `/opt/livekit/deploy.sh <sha>` on the instance via SSM and polls
+for completion.
+
+**Bug found live, 2026-08-03:** the first version of this job called
+`createDeployment` but never followed up with `createDeploymentStatus`.
+Buildkite's "Trigger builds on deployments" setting is literally named
+`build_deployment_status_created` in its own API — it fires on the
+`deployment_status` GitHub webhook event, not plain `deployment`. Without
+the status call, PR #7 merged, the image built and pushed to ECR
+successfully, a Deployment record existed... and Buildkite never triggered
+at all (confirmed via `bk build list` / the Buildkite API — zero new
+builds). No production impact resulted (the on-box SSM deploy never fired),
+but this was a real gap, not a hypothetical one. `ardiustech/tax-credits-mcp`'s
+own `release.yml` (the reference this architecture was modeled on) has the
+exact same gap — and its Buildkite pipeline doesn't even appear in this
+org's pipeline list, meaning that "precedent" was never actually confirmed
+to trigger live either. Lesson: verify a referenced pipeline's actual build
+history before trusting it as proof a pattern works.
 
 **This is NOT a blue/green swap like watercooler's own app deploy.** LiveKit
 runs `network_mode: host` bound to fixed ports (7880 signaling, 7881/7882

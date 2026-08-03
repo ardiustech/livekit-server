@@ -234,6 +234,20 @@ jobs:
       # `needs: test` already provides the intended gating, so there's
       # nothing left to wait on; without this, a future branch-protection
       # change could leave deployments silently pending forever.
+      # Bug found live (2026-08-03): creating a Deployment alone does NOT fire
+      # a GitHub `deployment_status` webhook event — only an explicit
+      # createDeploymentStatus call does. Buildkite's "Trigger builds on
+      # deployments" setting is literally named `build_deployment_status_created`
+      # in its own API (confirmed via GET on the pipeline's provider settings)
+      # — it listens for THAT event, not plain `deployment`. Without this
+      # status call, PR #7 merged, this job ran and pushed to ECR
+      # successfully, a Deployment record was created... and Buildkite never
+      # triggered at all (confirmed: `bk build list` showed zero new builds).
+      # ardiustech/tax-credits-mcp's own workflow (the reference this
+      # architecture was modeled on) has this exact same gap and was never
+      # actually confirmed to trigger live either — its Buildkite pipeline
+      # doesn't even exist under this org's pipeline list. Do not trust that
+      # "precedent" again without checking real build history.
       - name: Create GitHub Deployment
         if: steps.check-secrets.outputs.skip == 'false' && steps.check-deployment.outputs.exists == 'false'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -249,3 +263,15 @@ jobs:
               description: 'Deploy livekit-server to production',
             });
             console.log(`Created deployment ${deployment.data.id}`);
+            // This is the actual trigger Buildkite listens for. `success` here
+            // just means "image is built and pushed, ready for CD to pick up"
+            // — it does NOT mean the on-box deploy itself succeeded; Buildkite
+            // owns reporting the real deploy outcome via its own build status.
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              description: 'Image built and pushed to ECR; handing off to Buildkite for on-box deploy',
+            });
+            console.log(`Created deployment_status for deployment ${deployment.data.id}`);
