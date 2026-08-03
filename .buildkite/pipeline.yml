@@ -1,279 +1,43 @@
-# Buildkite CI/CD for the ardiustech/livekit-server fork (pipeline slug:
-# tax-credits-livekit-server). Mirrors ardiustech/watercooler's own
-# .buildkite/pipeline.yml structure (CI -> wait -> gated CD via SSM) — see that
-# repo's .buildkite/README.md for the shared conventions (secret storage,
-# soft-skip-until-activated pattern, etc.).
+# Buildkite CD (deploy only) for the ardiustech/livekit-server fork
+# (pipeline slug: tax-credits-livekit-server).
 #
-# This repo had NO CI/CD at all before this: the inherited upstream
-# .github/workflows/buildtest.yaml exists but isn't wired in as a required
-# check (flagged in PR #1's third adversarial-review round), and deploy was a
-# fully manual SSM runbook (see ardiustech/watercooler's
-# infrastructure/livekit/README.md, "Rolling the LiveKit version" section,
-# pre-this-pipeline).
+# CI (build/vet/test) moved to GitHub Actions — see
+# .github/workflows/buildtest.yaml for the full history of why: 18 straight
+# Buildkite build attempts reproducibly failed `go mod download`'s ~120+
+# fresh fetches from proxy.golang.org (different agent, different queue,
+# every environmental lever tried — GOMAXPROCS, GOSUMDB, IPv6 disable,
+# dependency scoping, an internal module cache), while the identical
+# download finished in 12s from an unrelated network. That points to a hard
+# connection-count/rate limit in Buildkite's own network infra, not
+# something fixable in this repo's config — GitHub Actions runners aren't on
+# that network at all.
 #
-# To wire this up, the Buildkite pipeline's initial step should be
-# `buildkite-agent pipeline upload`, which reads this file. See .buildkite/README.md.
-
-# queue: default (NOT default_stable, review finding 2026-08-02): go mod
-# download reproducibly hung ~60-65s into fetching public dependencies from
-# proxy.golang.org on 3 different default_stable agents, while the identical
-# `go mod download` against the identical commit finished in 12s from an
-# unrelated network — isolating the problem to default_stable's own network
-# path, not the code or this pipeline's config. ardiustech/tax-credits-mcp's
-# own Buildkite pipeline runs `go build` (same golang:1.26 image, same
-# -buildvcs=false flag) successfully in production on queue "default" — the
-# most direct evidence available that default_stable and default have
-# meaningfully different network configurations for exactly this kind of
-# public-dependency fetch. Using default here on that basis; worth reverting
-# once default_stable's underlying network issue is actually fixed upstream
-# (a #build-stability question, not something this pipeline can control).
+# This pipeline is triggered by a GitHub Deployment (created by the "deploy"
+# job in buildtest.yaml, only after CI passes on a push to master) — enable
+# "Trigger builds on deployments" in this pipeline's Buildkite settings.
+# Mirrors ardiustech/tax-credits-mcp's own working pipeline structure (same
+# trigger mechanism, same BUILDKITE_GITHUB_DEPLOYMENT_* env vars) — the only
+# other Go project in this org with in-repo evidence of what actually works.
+#
+# Deploy mechanism is unchanged from before this split: builds + pushes an
+# amd64 image (the LiveKit box is a c6i x86_64 instance, unlike the
+# watercooler app's arm64 box) and triggers an on-box graceful-drain deploy
+# via SSM. NOT a blue/green swap — LiveKit binds fixed host-network ports, so
+# there's no second color to flip to. Instead it leans on LiveKit's own
+# built-in graceful shutdown (SIGTERM -> router.Drain() + wait for active
+# participants to leave, already how the binary behaves): a deploy doesn't
+# forcibly drop calls in progress, new joins just pause for the drain window.
+# True zero-downtime needs a second node + Redis-backed multi-node LiveKit, a
+# separate, materially bigger effort. Requires LK_AWS_ACCESS_KEY_ID /
+# LK_AWS_SECRET_ACCESS_KEY secrets (the watercooler-livekit-ci IAM user) —
+# named LK_* to avoid clashing with the agent's existing AWS_* creds or
+# watercooler's own WC_* creds. See .buildkite/README.md.
 agents:
   queue: default
 
 steps:
-  - label: ":golang: build · vet · test"
-    if: build.source != "schedule"
-    timeout_in_minutes: 15
-    command:
-      # gofmt only the files THIS PR/commit actually touches, not the whole
-      # tree (review finding, 2026-08-02: gate-the-whole-repo would have
-      # forced reformatting pre-existing upstream files unrelated to this
-      # change, working against this fork's own low-diff-vs-upstream sync
-      # strategy — see ARDIUSTECH_FORK.md). Outside a PR context (e.g. a
-      # direct push to master), diffs against this push's own parent commit
-      # rather than origin/master, which by build time already IS the commit
-      # being built (review finding, 2026-08-02: diffing against origin/$base
-      # unconditionally made this check silently no-op on every master push).
-      # Also no-ops cleanly if a build ever has zero .go changes (empty xargs
-      # input is not an error, and bare `gofmt` is never invoked with no
-      # args, so it can't block reading stdin — a real gap in the previous
-      # version of this check).
-      # Fixes git ownership at the root, not just Go's own symptom of it
-      # (confirmed live, build #7, 2026-08-02): GOFLAGS=-buildvcs=false below
-      # only suppresses `go build`'s OWN internal git-based VCS stamping — it
-      # does nothing for the explicit `git fetch`/`git diff`/`git rev-parse`
-      # calls in the gofmt-diff script right below, which hit the exact same
-      # "dubious ownership" wall on their own and failed the whole build on
-      # this pipeline's first real production-deploy attempt. This is the
-      # standard, root-cause fix for a docker-mounted checkout owned by a
-      # different UID than the container's user — should have been here from
-      # build #1 instead of only patching the Go-internal symptom.
-      - git config --global --add safe.directory '*'
-      # DIAGNOSTIC (2026-08-02): testing a specific, well-known Docker/Go
-      # failure mode for the go-mod-download hangs chased through builds
-      # #1-16 — Go's HTTP client does Happy Eyeballs (tries IPv4 and IPv6 in
-      # parallel); if this container's IPv6 route is silently dropped
-      # (rather than cleanly rejected) by a security group/NAT, an attempt
-      # that picks IPv6 hangs until a TCP-level connect timeout, commonly
-      # ~60-75s — matching the observed delay exactly. Reporting current
-      # state, then trying to disable IPv6 outright; if the sysctl write is
-      # denied (likely, without NET_ADMIN/--privileged), this just logs that
-      # and moves on rather than failing the build on a diagnostic step.
-      - |
-        echo "--- ipv6 diagnostic ---"
-        ip -6 addr show 2>&1 || echo "no ip -6 output"
-        cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>&1 || echo "no disable_ipv6 file"
-        sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>&1 || echo "sysctl write failed/denied (expected without NET_ADMIN)"
-      # No `git fetch` here (confirmed live, build #8, 2026-08-02): the
-      # container has no known_hosts entry for github.com, so a fetch over
-      # the origin remote's ssh:// URL hangs forever on an interactive
-      # "are you sure you want to continue connecting" host-key prompt —
-      # with no TTY in CI, that's an unrecoverable hang, not a fast failure.
-      # Not needed anyway: Buildkite's own agent-level checkout (which DOES
-      # have a trusted, working git/ssh setup) already fetched everything
-      # this needs — origin/<base> for a PR, and enough history for HEAD^ on
-      # a direct push — before this container ever started. Relies entirely
-      # on refs already present locally; the `git rev-parse --verify --quiet`
-      # check below still skips cleanly (not a hard failure) if a ref
-      # somehow isn't there (e.g. an unusually shallow agent clone).
-      - |
-        set -o pipefail
-        base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
-        if [ -n "$base" ] && git rev-parse --verify --quiet "origin/$base" >/dev/null; then
-          diff_range="origin/$base...HEAD"
-        elif git rev-parse --verify --quiet "HEAD^" >/dev/null; then
-          # Direct push (e.g. master), or a PR base ref that isn't locally
-          # resolvable for some reason: by the time this runs, origin/master
-          # IS this commit, so diffing against it is always empty (review
-          # finding, 2026-08-02) — diff against this push's own parent
-          # instead.
-          diff_range="HEAD^..HEAD"
-        else
-          # Neither ref resolvable (e.g. the very first commit ever, or an
-          # unusually shallow clone) — skip the check rather than fail the
-          # build on an unrelated gap.
-          diff_range=""
-        fi
-        if [ -n "$diff_range" ]; then
-          changed_go_files="$(git diff --name-only --diff-filter=ACM "$diff_range" -- '*.go')"
-        else
-          changed_go_files=""
-        fi
-        if [ -n "$changed_go_files" ]; then
-          fmt_out="$(echo "$changed_go_files" | xargs gofmt -l)"
-          if [ -n "$fmt_out" ]; then
-            echo "gofmt would reformat:" >&2
-            echo "$fmt_out" >&2
-            exit 1
-          fi
-        fi
-      # Some tests (pkg/rtc/test's multi-node/agent cases) need a real Redis
-      # at localhost:6379, matching what the inherited upstream buildtest.yaml
-      # already provides via a GitHub Actions service container (confirmed
-      # live, build #2, 2026-08-02: TestAgentMultiNode panics with "unable to
-      # connect to redis" without one — my own earlier local `go test ./...`
-      # runs silently passed only because a redis-server happens to already
-      # be running on that machine, masking this everywhere except an actual
-      # clean CI run). Tried a docker-compose sidecar first (build #3) but
-      # docker-compose-buildkite-plugin doesn't correctly bind-mount the
-      # checkout the way docker#v5.13.0 does ("not a git repository" / "does
-      # not contain main module") AND warns it doesn't properly support
-      # step-level array commands — reverted rather than fight both issues.
-      # Installing redis INSIDE the same container as a background process is
-      # simpler: no cross-container networking or mount semantics to get
-      # right, and localhost:6379 trivially resolves since it's the same
-      # container's own loopback.
-      - apt-get update -qq && apt-get install -qq -y redis-server >/dev/null
-      - redis-server --daemonize yes
-      - go build ./...
-      # $pkgs computed once, reused for both vet and test (review finding,
-      # 2026-08-02: go vet ./... — unscoped — was itself the reason
-      # go.uber.org/... -> ory/dockertest -> github.com/felixge/httpsnoop
-      # ever needed fetching at all. `go vet` type-checks _test.go files
-      # (unlike plain `go build`, confirmed via `go list -deps ./...`
-      # containing zero httpsnoop references vs `go list -test -deps
-      # ./pkg/service/...` containing one), so it was pulling in
-      # pkg/service/docker_test.go's ory/dockertest import chain even though
-      # that package's tests never actually run here. Three straight builds
-      # (#1, #14, #15) died on that EXACT package, always last in the
-      # download log — a specific dependency's reachability, not a generic
-      # rate/count limit as first suspected. Excluding the same two packages
-      # from vet that are already excluded from test means CI now never
-      # needs to resolve it at all.
-      #
-      # ./test/... excluded (confirmed live, build #4): TestMultinodeData
-      # Publishing/TestDataPublishSlowSubscriber/TestTurnRelay do real
-      # end-to-end WebRTC UDP ICE/STUN/TURN work that a generic sandboxed CI
-      # container's networking often can't reliably support regardless of
-      # whether the code is correct — same category as the pre-existing
-      # flaky ICE tests already documented in ARDIUSTECH_FORK.md.
-      #
-      # ./pkg/service/... excluded (confirmed live, build #5): its
-      # docker_test.go TestMain calls dockertest.NewPool, needing a real
-      # Docker daemon at /var/run/docker.sock not present in this container
-      # (Docker-outside-of-Docker is a real capability worth adding later,
-      # not attempted here on top of everything else this pipeline needed).
-      #
-      # None of the fork's own changes live in either excluded package;
-      # they're entirely under ./pkg/rtc/. Run ./test/... and
-      # ./pkg/service/... manually (real network, real Docker daemon)
-      # before shipping anything that actually touches ICE/TURN/multi-node
-      # behavior or the code those tests cover — this gate going green is
-      # not a substitute for that. Fails fast if `go list` itself errors
-      # (build-cache/disk hiccup) rather than falling back to a bare `go
-      # vet`/`go test` that would silently only cover the cwd package and
-      # still exit 0.
-      - |
-        pkgs=$(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$')
-        [ -n "$pkgs" ]
-        go vet $pkgs
-        go test -race $pkgs
-    plugins:
-      # Caches the Go module directory across builds of THIS step on THIS
-      # branch (review finding, 2026-08-02 — the actual root cause of every
-      # prior fix's residual flakiness): builds #1-16 kept dying partway
-      # through `go mod download`'s ~120+ fresh fetches from proxy.golang.org
-      # — different agent, different queue, different specific package each
-      # time — while the identical download finished in 12s from an
-      # unrelated network. That pattern (large fresh-fetch volume, not a
-      # specific host/queue/package) points to a connection-count/rate limit
-      # somewhere in this network's egress path, not a fixable code issue.
-      # ardiustech/tax-credits-mcp's own working Buildkite Go build (same
-      # golang:1.26 image) never approaches that threshold because its
-      # dependency graph is tiny by comparison. Caching means only a NEW
-      # dependency (added since the last build on this branch) is ever
-      # fetched fresh — steady-state builds need zero or a handful of
-      # downloads instead of ~120+, which should stay well under whatever
-      # that threshold is. `internal_path:` (not `path:`/external cache) is
-      # the right tool here per this plugin's own docs: "speeds up runtime
-      # within a single step" across repeated runs of THIS step, restored
-      # automatically in the pre-command hook — no separate `restore:` block
-      # needed, and nothing here is shared with or readable by any other
-      # step. `GOMODCACHE` below points at a path INSIDE the docker-mounted
-      # checkout (`/workdir` on the container side) specifically because
-      # this plugin's cache mechanism runs on the HOST agent, not inside the
-      # container — a cache path outside the mounted checkout would be
-      # invisible to it and silently never get cached at all (an explicitly
-      # called-out mistake in the plugin's own README).
-      - ssh://git@github.com/Gusto/cache-buildkite-plugin.git#v2.10.0:
-          save:
-            name: livekit-server-go-mod-cache
-            internal_path: .gomodcache
-            max_internal_size: 1024
-      - docker#v5.13.0:
-          image: "golang:1.26"
-          environment:
-            - "CI=true"
-            # Host-visible path for the cache plugin above (see its comment)
-            # — NOT the image's own default ($HOME/go/pkg/mod), which lives
-            # outside the checkout and would never get cached.
-            - "GOMODCACHE=/workdir/.gomodcache"
-            # -buildvcs=false (confirmed live, build #1, 2026-08-02): the
-            # docker plugin's mounted checkout is owned by a different UID
-            # than the container's user, tripping git's "dubious ownership"
-            # safety check — go build's automatic VCS stamping then fails
-            # outright ("error obtaining VCS status: exit status 128"),
-            # taking the whole step down with it. The stamped info isn't used
-            # anyway (ECR images are already tagged by commit SHA via
-            # BUILDKITE_COMMIT). Kept as belt-and-suspenders alongside the
-            # `git config --global --add safe.directory '*'` command above
-            # (the actual root-cause fix, added after build #7 — this env var
-            # alone only covers go build's OWN internal git usage, not the
-            # explicit git commands in the gofmt-diff script).
-            - "GOFLAGS=-mod=mod -buildvcs=false"
-            # GOSUMDB=off — kept as a real, independent hardening (this CI
-            # container builds a fork we already trust; go.sum still pins
-            # exact versions/hashes regardless), but NOT sufficient alone
-            # (confirmed live, builds #9-14): go mod download kept dying
-            # ~60-65s into fetching public dependencies on FIVE different
-            # agents across BOTH the default_stable and default queues, at a
-            # LATE, seemingly-arbitrary point each time (different package
-            # name per run) — ruling out one bad host, one queue, and one
-            # specific blocked package/checksum call.
-            - "GOSUMDB=off"
-            # GOMAXPROCS=2 (confirmed live, build #14, 2026-08-02): the
-            # identical `go mod download` finished in 12s from an unrelated
-            # network, so this isn't proxy.golang.org being unreachable —
-            # it's specific to THIS repo's unusually large dependency graph
-            # (the full pion/WebRTC stack, gRPC, OpenTelemetry, dozens of
-            # packages) fetched with Go's default high fetch concurrency.
-            # ardiustech/tax-credits-mcp's own Buildkite pipeline builds a
-            # single small Lambda function (same golang:1.26 image, same
-            # -buildvcs=false) successfully — its dependency graph is far
-            # smaller and likely never approaches whatever connection-
-            # count/rate threshold this repo's graph reliably hits. Go's
-            # module-fetch concurrency scales with GOMAXPROCS; capping it
-            # throttles concurrent outbound connections without needing to
-            # know exactly which device in the egress path (NAT gateway,
-            # inspection proxy) is imposing the limit.
-            - "GOMAXPROCS=2"
-
-  # Gate the deploy on the checks above passing.
-  - wait
-
-  # CD: only on master (this repo's default branch — NOT "main", unlike
-  # watercooler). Builds + pushes an amd64 image (the LiveKit box is a c6i
-  # x86_64 instance, unlike the app's arm64 t4g — see
-  # ardiustech/watercooler's infrastructure/livekit/README.md "Notes / decisions")
-  # and triggers the on-box graceful deploy via SSM. Runs on the agent's Docker
-  # (needs buildx), not the docker plugin. Requires
-  # LK_AWS_ACCESS_KEY_ID / LK_AWS_SECRET_ACCESS_KEY secrets (the
-  # watercooler-livekit-ci IAM user) — named LK_* to avoid clashing with the
-  # agent's existing AWS_* creds or watercooler's own WC_* creds (this is a
-  # DIFFERENT IAM user, scoped to the livekit-server ECR repo + the livekit
-  # instance only). See .buildkite/README.md.
   - label: ":rocket: deploy (graceful drain)"
-    if: build.branch == "master" && build.source != "schedule"
+    if: build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") == "production"
     command: .buildkite/steps/deploy.sh
     timeout_in_minutes: 25
     # Only ONE deploy against this single-node box at a time (review finding,
