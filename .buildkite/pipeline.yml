@@ -1,33 +1,33 @@
-# Buildkite CD (deploy only) for the ardiustech/livekit-server fork
+# Buildkite CD (SSM trigger only) for the ardiustech/livekit-server fork
 # (pipeline slug: tax-credits-livekit-server).
 #
-# CI (build/vet/test) moved to GitHub Actions — see
-# .github/workflows/buildtest.yaml for the full history of why: 18 straight
-# Buildkite build attempts reproducibly failed `go mod download`'s ~120+
-# fresh fetches from proxy.golang.org (different agent, different queue,
-# every environmental lever tried — GOMAXPROCS, GOSUMDB, IPv6 disable,
-# dependency scoping, an internal module cache), while the identical
-# download finished in 12s from an unrelated network. That points to a hard
-# connection-count/rate limit in Buildkite's own network infra, not
-# something fixable in this repo's config — GitHub Actions runners aren't on
-# that network at all.
+# CI (build/vet/test) AND the image build+push both moved to GitHub Actions
+# (review finding, 2026-08-03) — see .github/workflows/buildtest.yaml for the
+# full history. Short version: 18 straight Buildkite build attempts
+# reproducibly failed `go mod download`'s ~120+ fresh fetches from
+# proxy.golang.org (different agent, different queue, every environmental
+# lever tried), while the identical download finished in 12s from an
+# unrelated network — a hard connection-count/rate limit in Buildkite's own
+# network infra, not something fixable in this repo's config. The image
+# build ALSO runs `go mod download` (via the Dockerfile's build stage), so it
+# moved too, rather than leaving that same untested risk sitting in the
+# deploy path. This pipeline's only remaining job — the SSM trigger + poll —
+# never touched proxy.golang.org in the first place.
 #
-# This pipeline is triggered by a GitHub Deployment (created by the "deploy"
-# job in buildtest.yaml, only after CI passes on a push to master) — enable
-# "Trigger builds on deployments" in this pipeline's Buildkite settings.
-# Mirrors ardiustech/tax-credits-mcp's own working pipeline structure (same
-# trigger mechanism, same BUILDKITE_GITHUB_DEPLOYMENT_* env vars) — the only
-# other Go project in this org with in-repo evidence of what actually works.
+# Triggered by a GitHub Deployment (created by buildtest.yaml's
+# build-and-deploy job, only after CI passes AND the image is already pushed
+# to ECR) — enable "Trigger builds on deployments" in this pipeline's
+# Buildkite settings. Mirrors ardiustech/tax-credits-mcp's own working
+# pipeline structure (same trigger mechanism, same
+# BUILDKITE_GITHUB_DEPLOYMENT_* env vars).
 #
-# Deploy mechanism is unchanged from before this split: builds + pushes an
-# amd64 image (the LiveKit box is a c6i x86_64 instance, unlike the
-# watercooler app's arm64 box) and triggers an on-box graceful-drain deploy
-# via SSM. NOT a blue/green swap — LiveKit binds fixed host-network ports, so
-# there's no second color to flip to. Instead it leans on LiveKit's own
-# built-in graceful shutdown (SIGTERM -> router.Drain() + wait for active
-# participants to leave, already how the binary behaves): a deploy doesn't
-# forcibly drop calls in progress, new joins just pause for the drain window.
-# True zero-downtime needs a second node + Redis-backed multi-node LiveKit, a
+# Deploy mechanism: triggers an on-box graceful-drain deploy via SSM. NOT a
+# blue/green swap — LiveKit binds fixed host-network ports, so there's no
+# second color to flip to. Instead it leans on LiveKit's own built-in
+# graceful shutdown (SIGTERM -> router.Drain() + wait for active participants
+# to leave, already how the binary behaves): a deploy doesn't forcibly drop
+# calls in progress, new joins just pause for the drain window. True
+# zero-downtime needs a second node + Redis-backed multi-node LiveKit, a
 # separate, materially bigger effort. Requires LK_AWS_ACCESS_KEY_ID /
 # LK_AWS_SECRET_ACCESS_KEY secrets (the watercooler-livekit-ci IAM user) —
 # named LK_* to avoid clashing with the agent's existing AWS_* creds or
@@ -37,7 +37,17 @@ agents:
 
 steps:
   - label: ":rocket: deploy (graceful drain)"
-    if: build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") == "production"
+    # build.branch == "master" here is defense-in-depth, not the actual
+    # authorization boundary (review finding, 2026-08-03 — must-fix):
+    # BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT is a label anyone with
+    # `deployments: write` on the repo could set via the Deployments API
+    # directly, for an arbitrary ref — confirmed live that this repo has
+    # neither a GitHub Environment protection rule nor branch protection to
+    # close that gap at the GitHub-API layer. The actual class-eliminating
+    # check lives in deploy.sh itself: it refuses to touch AWS credentials
+    # unless $BUILDKITE_COMMIT is a verified ancestor of origin/master,
+    # regardless of what this `if:` or the deployment's label claim.
+    if: build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") == "production" && build.branch == "master"
     command: .buildkite/steps/deploy.sh
     timeout_in_minutes: 25
     # Only ONE deploy against this single-node box at a time (review finding,
@@ -52,6 +62,6 @@ steps:
     # timing out while the box is still legitimately mid-graceful-drain) can
     # fire a SECOND live SSM command against the same box while the first is
     # still running, racing on the same docker-compose.yaml/.env. A transient
-    # build/push failure (the actually-safe-to-retry case) should be re-run
-    # manually after confirming via `.buildkite/steps/deploy.sh`'s own SSM
-    # command id whether a deploy is already in flight.
+    # failure should be re-run manually after confirming via
+    # `.buildkite/steps/deploy.sh`'s own SSM command id whether a deploy is
+    # already in flight.

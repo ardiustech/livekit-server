@@ -39,6 +39,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Cancel a superseded run of THIS job on the same ref (review finding,
+    # 2026-08-03) — rapid pushes previously queued redundant full test runs
+    # instead of canceling stale ones. Scoped to `test` only, not the whole
+    # workflow, so this never touches `deploy`'s own concurrency group below.
+    concurrency:
+      group: livekit-server-test-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       # fetch-depth: 0 (full history), not the actions/checkout default
       # (single commit) — needed for the diff-scoped gofmt check below to
@@ -113,19 +120,113 @@ jobs:
       - name: Vet + test
         run: |
           pkgs=$(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$')
+          # Fails fast if `go list` itself errors (build-cache/disk hiccup)
+          # rather than silently falling back to a bare `go vet`/`go test`
+          # that would cover only the cwd package and still exit 0 — the
+          # exact "silently passes" gap the gofmt check above is also
+          # hardened against.
           [ -n "$pkgs" ]
           go vet $pkgs
           go test -race $pkgs
 
-  deploy:
-    name: Trigger Buildkite deploy
+  # Builds + pushes the image AND triggers the on-box deploy — moved here in
+  # full (review finding, 2026-08-03) rather than leaving the build inside
+  # Buildkite's own step. The PR that introduced this split moved go
+  # build/vet/test off Buildkite's network but left `docker buildx build`
+  # (which ALSO runs `go mod download`, via the Dockerfile's build stage)
+  # running inside Buildkite's deploy step — completely untested against the
+  # exact failure mode that killed 18/18 prior CI attempts, just moved from
+  # blocking a CI gate to blocking an actual production deploy. Buildkite's
+  # only remaining job is the final SSM trigger, which never touched
+  # proxy.golang.org in the first place.
+  build-and-deploy:
+    name: Build, push, and deploy
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    # Serialize deploys (review finding, 2026-08-03) — NOT cancel-in-progress
+    # like the test job's group above: two out-of-order deploys completing
+    # out of order could otherwise let an older commit silently redeploy
+    # over a newer one, with everything reporting green. Queuing (not
+    # canceling) means they still run in submission order.
+    concurrency:
+      group: livekit-server-deploy
+      cancel-in-progress: false
     permissions:
       deployments: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.LK_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.LK_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-west-2
+      ECR_REGISTRY: "396735084811.dkr.ecr.us-west-2.amazonaws.com"
+      ECR_REPO: livekit-server
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Soft-skip if CD isn't activated
+        id: check-secrets
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "CD not activated: LK_AWS_ACCESS_KEY_ID / LK_AWS_SECRET_ACCESS_KEY repo secrets not set."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check-secrets.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ECR
+        if: steps.check-secrets.outputs.skip == 'false'
+        run: |
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      # amd64 only — the LiveKit box is a c6i (Intel) instance, not arm64
+      # like the watercooler app's t4g box (see ardiustech/watercooler's
+      # infrastructure/livekit/README.md "Notes / decisions"). This is the
+      # EXACT `go build`/`go mod download` step blamed for 18/18 CI failures
+      # on Buildkite's network — running it here instead is the whole point
+      # of this job existing.
+      - name: Build + push image
+        if: steps.check-secrets.outputs.skip == 'false'
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -t "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}" \
+            -t "$ECR_REGISTRY/$ECR_REPO:latest" \
+            --push .
+
+      # Idempotency check (review finding, 2026-08-03): a manual workflow
+      # re-run on an already-deployed SHA would otherwise create a
+      # duplicate deployment, triggering a redundant image build/push (now
+      # harmless, just wasted work — but ALSO a live SSM graceful-drain
+      # restart on the box for zero code change).
+      - name: Check for an existing deployment
+        if: steps.check-secrets.outputs.skip == 'false'
+        id: check-deployment
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const existing = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              environment: 'production',
+            });
+            core.setOutput('exists', existing.data.length > 0 ? 'true' : 'false');
+
+      # environment: 'production' here MUST match .buildkite/pipeline.yml's
+      # `build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") ==
+      # "production"` check exactly — a typo or rename on either side
+      # silently no-ops the trigger with no error on this side.
+      # required_contexts: [] deliberately bypasses GitHub's default
+      # wait-on-required-checks behavior for deployments — this job's own
+      # `needs: test` already provides the intended gating, so there's
+      # nothing left to wait on; without this, a future branch-protection
+      # change could leave deployments silently pending forever.
       - name: Create GitHub Deployment
+        if: steps.check-secrets.outputs.skip == 'false' && steps.check-deployment.outputs.exists == 'false'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
