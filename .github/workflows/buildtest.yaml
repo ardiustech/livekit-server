@@ -40,7 +40,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 (full history), not the actions/checkout default
+      # (single commit) — needed for the diff-scoped gofmt check below to
+      # resolve origin/<base> / HEAD^ without a separate fetch.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
 
       - uses: shogo82148/actions-setup-redis@2f3253b148c73d7a0682eae73e862b777a4fa74e # v1
         with:
@@ -53,13 +58,39 @@ jobs:
         with:
           go-version: "^1.26"
 
+      # gofmt only the files THIS PR/commit actually touches, not the whole
+      # tree — an unscoped check (confirmed live, this workflow's first PR
+      # run) immediately fails on 4 pre-existing upstream files
+      # (magefile.go, pkg/agent/client.go, pkg/service/basic_auth.go,
+      # pkg/sfu/packettrailer/packet_trailer_test.go) that are deliberately
+      # left unformatted — gating the whole tree would force reformatting
+      # unrelated upstream files on every future PR, working against this
+      # fork's own low-diff-vs-upstream sync strategy (ARDIUSTECH_FORK.md;
+      # same reasoning already settled on the retired Buildkite CI step,
+      # reused verbatim here).
       - name: gofmt
         run: |
-          fmt_out="$(gofmt -l $(git ls-files '*.go'))"
-          if [ -n "$fmt_out" ]; then
-            echo "gofmt would reformat:" >&2
-            echo "$fmt_out" >&2
-            exit 1
+          set -o pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$base" ] && git rev-parse --verify --quiet "$base" >/dev/null; then
+            diff_range="$base...HEAD"
+          elif git rev-parse --verify --quiet "HEAD^" >/dev/null; then
+            diff_range="HEAD^..HEAD"
+          else
+            diff_range=""
+          fi
+          if [ -n "$diff_range" ]; then
+            changed_go_files="$(git diff --name-only --diff-filter=ACM "$diff_range" -- '*.go')"
+          else
+            changed_go_files=""
+          fi
+          if [ -n "$changed_go_files" ]; then
+            fmt_out="$(echo "$changed_go_files" | xargs gofmt -l)"
+            if [ -n "$fmt_out" ]; then
+              echo "gofmt would reformat:" >&2
+              echo "$fmt_out" >&2
+              exit 1
+            fi
           fi
 
       - name: Build
