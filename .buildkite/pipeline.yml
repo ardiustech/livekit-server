@@ -59,6 +59,21 @@ steps:
       # different UID than the container's user — should have been here from
       # build #1 instead of only patching the Go-internal symptom.
       - git config --global --add safe.directory '*'
+      # DIAGNOSTIC (2026-08-02): testing a specific, well-known Docker/Go
+      # failure mode for the go-mod-download hangs chased through builds
+      # #1-16 — Go's HTTP client does Happy Eyeballs (tries IPv4 and IPv6 in
+      # parallel); if this container's IPv6 route is silently dropped
+      # (rather than cleanly rejected) by a security group/NAT, an attempt
+      # that picks IPv6 hangs until a TCP-level connect timeout, commonly
+      # ~60-75s — matching the observed delay exactly. Reporting current
+      # state, then trying to disable IPv6 outright; if the sysctl write is
+      # denied (likely, without NET_ADMIN/--privileged), this just logs that
+      # and moves on rather than failing the build on a diagnostic step.
+      - |
+        echo "--- ipv6 diagnostic ---"
+        ip -6 addr show 2>&1 || echo "no ip -6 output"
+        cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>&1 || echo "no disable_ipv6 file"
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>&1 || echo "sysctl write failed/denied (expected without NET_ADMIN)"
       # No `git fetch` here (confirmed live, build #8, 2026-08-02): the
       # container has no known_hosts entry for github.com, so a fetch over
       # the origin remote's ssh:// URL hangs forever on an interactive
