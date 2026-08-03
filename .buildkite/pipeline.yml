@@ -121,42 +121,48 @@ steps:
       - apt-get update -qq && apt-get install -qq -y redis-server >/dev/null
       - redis-server --daemonize yes
       - go build ./...
-      - go vet ./...
-      # Excludes ./test/... (confirmed live, build #4, 2026-08-02):
-      # TestMultinodeDataPublishing/TestDataPublishSlowSubscriber/TestTurnRelay
-      # failed — real end-to-end WebRTC tests doing actual UDP ICE/STUN
-      # reflexive-candidate gathering and TURN relay, which a generic
-      # sandboxed CI container's networking often can't reliably support
-      # (restricted/NATed UDP paths, no real TURN reachability) regardless of
-      # whether the code itself is correct. Same category of pre-existing
-      # flakiness already documented for pkg/rtc/transport_test.go's ICE
-      # tests in ardiustech/livekit-server's ARDIUSTECH_FORK.md (confirmed
-      # flaky on completely unmodified upstream code too, by stashing
-      # patches and re-running) — this just broadens that same acceptance to
-      # the top-level package.
+      # $pkgs computed once, reused for both vet and test (review finding,
+      # 2026-08-02: go vet ./... — unscoped — was itself the reason
+      # go.uber.org/... -> ory/dockertest -> github.com/felixge/httpsnoop
+      # ever needed fetching at all. `go vet` type-checks _test.go files
+      # (unlike plain `go build`, confirmed via `go list -deps ./...`
+      # containing zero httpsnoop references vs `go list -test -deps
+      # ./pkg/service/...` containing one), so it was pulling in
+      # pkg/service/docker_test.go's ory/dockertest import chain even though
+      # that package's tests never actually run here. Three straight builds
+      # (#1, #14, #15) died on that EXACT package, always last in the
+      # download log — a specific dependency's reachability, not a generic
+      # rate/count limit as first suspected. Excluding the same two packages
+      # from vet that are already excluded from test means CI now never
+      # needs to resolve it at all.
       #
-      # Also excludes ./pkg/service/... (confirmed live, build #5): its
-      # docker_test.go TestMain calls dockertest.NewPool, which needs a real
-      # Docker daemon reachable at /var/run/docker.sock — not present inside
-      # this step's own container (that would need Docker-outside-of-Docker:
-      # mounting the AGENT's host socket into this container, plus getting
-      # the spawned sibling containers' networking to line up with THIS
-      # container's view of "localhost" — a real CI capability worth adding
-      # later, just not attempted here to avoid trading one fragile fix for
-      # another on top of everything else this pipeline already needed).
+      # ./test/... excluded (confirmed live, build #4): TestMultinodeData
+      # Publishing/TestDataPublishSlowSubscriber/TestTurnRelay do real
+      # end-to-end WebRTC UDP ICE/STUN/TURN work that a generic sandboxed CI
+      # container's networking often can't reliably support regardless of
+      # whether the code is correct — same category as the pre-existing
+      # flaky ICE tests already documented in ARDIUSTECH_FORK.md.
+      #
+      # ./pkg/service/... excluded (confirmed live, build #5): its
+      # docker_test.go TestMain calls dockertest.NewPool, needing a real
+      # Docker daemon at /var/run/docker.sock not present in this container
+      # (Docker-outside-of-Docker is a real capability worth adding later,
+      # not attempted here on top of everything else this pipeline needed).
       #
       # None of the fork's own changes live in either excluded package;
       # they're entirely under ./pkg/rtc/. Run ./test/... and
-      # ./pkg/service/... manually (with a real network and a real Docker
-      # daemon respectively) before shipping anything that actually touches
-      # ICE/TURN/multi-node behavior or the code those tests cover — this
-      # gate going green is not a substitute for that.
-      # Fail fast if `go list` itself errors (build-cache/disk hiccup): a bare
-      # `go test -race` fallback would silently test only the cwd package and
-      # still exit 0 — the exact "silently passes" gap the gofmt check above
-      # was hardened against (review finding, 2026-08-02).
+      # ./pkg/service/... manually (real network, real Docker daemon)
+      # before shipping anything that actually touches ICE/TURN/multi-node
+      # behavior or the code those tests cover — this gate going green is
+      # not a substitute for that. Fails fast if `go list` itself errors
+      # (build-cache/disk hiccup) rather than falling back to a bare `go
+      # vet`/`go test` that would silently only cover the cwd package and
+      # still exit 0.
       - |
-        pkgs=$(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$') && [ -n "$pkgs" ] && go test -race $pkgs
+        pkgs=$(go list ./... | grep -vE '^github.com/livekit/livekit-server/(test|pkg/service)$')
+        [ -n "$pkgs" ]
+        go vet $pkgs
+        go test -race $pkgs
     plugins:
       - docker#v5.13.0:
           image: "golang:1.26"
