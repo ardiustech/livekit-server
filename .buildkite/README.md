@@ -214,13 +214,21 @@ aws ssm send-command --document-name AWS-RunShellScript \
    until a `push`/`pull_request` event fires against them at least once,
    which happened automatically when this fork's first CI-split PR opened).
 
-## Also required: make `test` a required status check
+## Branch/deployment protection (done, 2026-08-03)
 
-Separate from either CI/CD system: add GitHub Actions' `test` job as a
-**required** status check on `master` via branch protection, so a PR can't
-merge without it passing (flagged in PR #1's third adversarial-review round,
-still not done as of this writing — needs a GitHub admin on the `ardiustech`
-org, not something a repo-scoped token can set).
+- `master` now requires the `test` GitHub Actions job as a passing status
+  check, plus 1 approving review, before a PR can merge (flagged in PR #1's
+  third adversarial-review round — this closes it).
+- The `production` GitHub Environment now restricts deployments to protected
+  branches only (i.e. `master`) — this closes the forgeable-trigger gap at
+  the GitHub-API layer itself, complementing (not replacing) `deploy.sh`'s
+  own `git merge-base --is-ancestor` check.
+- Buildkite's "Trigger builds on deployments" is enabled on this pipeline.
+
+This PR is itself the first real end-to-end exercise of `build-and-deploy`
+(buildx → ECR push → GitHub Deployment → Buildkite SSM trigger) since #6
+merged — a deliberate smoke test before pointing `infrastructure/livekit`'s
+`terraform.tfvars` `livekit_image` at this fork's ECR repo for real.
 
 ## Inspecting builds (bk CLI)
 
