@@ -1,15 +1,22 @@
 #!/bin/bash
-# CD: build + push the amd64 image (tagged by commit SHA + latest), then trigger
-# the on-box graceful-drain deploy via SSM and wait for it. Runs on the agent's
-# Docker (needs buildx). Mirrors ardiustech/watercooler's own
-# .buildkite/steps/deploy.sh structure closely — see that file's comments for
-# the AWS-profile-isolation rationale, which is identical here.
+# CD: trigger the on-box graceful-drain deploy via SSM and wait for it.
+#
+# Does NOT build or push the image (review finding, 2026-08-03) — that now
+# happens in .github/workflows/buildtest.yaml's build-and-deploy job, which
+# creates the GitHub Deployment that triggers this step. Moved off Buildkite
+# entirely because `docker buildx build` ran `go mod download` inside the
+# Dockerfile's build stage, the exact command blamed for 18/18 CI failures
+# on Buildkite's network (see .buildkite/README.md) — leaving it here would
+# have moved that same untested risk from blocking a CI gate to blocking an
+# actual production deploy. This step's only remaining job (SSM trigger +
+# poll) never touched proxy.golang.org in the first place.
 #
 # Credentials come from LK_AWS_* Buildkite secrets (the watercooler-livekit-ci
 # IAM user — see ardiustech/watercooler's infrastructure/livekit/ci_user.tf).
 # NOT the same user/creds as watercooler's own WC_AWS_* (different repo,
-# different scope: this user can only push to the livekit-server ECR repo and
-# SendCommand to the livekit instance, nothing else).
+# different scope: this user can only SendCommand to the livekit instance;
+# it no longer needs ECR push access at all now that GitHub Actions owns the
+# build+push step).
 set -euo pipefail
 
 # Soft-skip until CD is activated (LK_AWS_* secrets set), so a merge before
@@ -20,9 +27,7 @@ if [ -z "${LK_AWS_ACCESS_KEY_ID:-}" ] || [ -z "${LK_AWS_SECRET_ACCESS_KEY:-}" ];
   exit 0
 fi
 
-ACCOUNT="${DEPLOY_ACCOUNT_ID:-396735084811}"
 REGION="${LK_AWS_REGION:-${LK_AWS_DEFAULT_REGION:-us-west-2}}"
-REPO="${ECR_REPO:-livekit-server}"
 INSTANCE_TAG="${INSTANCE_NAME_TAG:-watercooler-livekit-prod}"
 # The CUSTOM SSM document (ardiustech/watercooler's infrastructure/livekit/
 # ssm_document.tf), not the AWS-managed AWS-RunShellScript (review finding,
@@ -30,8 +35,6 @@ INSTANCE_TAG="${INSTANCE_NAME_TAG:-watercooler-livekit-prod}"
 # deploy.sh with a validated Tag, closing off the arbitrary-shell-command
 # surface the generic document would otherwise grant this CI credential).
 DEPLOY_DOCUMENT="${DEPLOY_DOCUMENT_NAME:-watercooler-livekit-deploy-prod}"
-REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
-IMAGE="$REGISTRY/$REPO"
 TAG="${BUILDKITE_COMMIT:-latest}"
 # How long to let LiveKit finish draining active calls on the box before the
 # SSM command itself gives up waiting. The on-box deploy.sh has its own,
@@ -45,6 +48,22 @@ TAG="${BUILDKITE_COMMIT:-latest}"
 # first was still finishing). 300 * 5s = 25min gives a real 10min buffer;
 # matches this step's own timeout_in_minutes in pipeline.yml.
 POLL_ATTEMPTS="${DEPLOY_POLL_ATTEMPTS:-300}"
+
+# Authorization guard (review finding, 2026-08-03 — must-fix): the pipeline's
+# own `if: build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") ==
+# "production"` check gates on a label anyone with `deployments: write` could
+# set via the Deployments API directly, for an ARBITRARY ref — confirmed live
+# that no GitHub Environment protection or branch protection exists on this
+# repo to close that gap at the GitHub-API layer. This is the actual
+# class-eliminating check: refuse to touch AWS credentials at all unless
+# $BUILDKITE_COMMIT is a real ancestor of origin/master, regardless of what
+# label the triggering deployment claimed.
+[ -n "${BUILDKITE_COMMIT:-}" ] || { echo "+++ :x: refusing to deploy — BUILDKITE_COMMIT is unset" >&2; exit 1; }
+git fetch --quiet origin master
+if ! git merge-base --is-ancestor "$BUILDKITE_COMMIT" origin/master; then
+  echo "+++ :x: refusing to deploy $BUILDKITE_COMMIT — not an ancestor of origin/master" >&2
+  exit 1
+fi
 
 # Isolated AWS profile dir (never the agent's ~/.aws), cleaned up on exit.
 AWS_DIR="$(mktemp -d)"
@@ -71,27 +90,6 @@ awscli() {
     -e AWS_PROFILE=lk -e AWS_DEFAULT_REGION="$REGION" \
     "$AWS_CLI_IMAGE" "$@"
 }
-
-echo "--- :docker: buildx builder"
-# create-or-use in one step (review finding, 2026-08-02: the previous
-# inspect-then-create-then-use had a TOCTOU window between concurrent
-# invocations on the same agent; --use folds the "make this the active
-# builder" step into create itself, and the fallback only runs if create
-# fails because the builder already exists).
-docker buildx create --name lkbuilder --driver docker-container --use \
-  || docker buildx use lkbuilder
-
-echo "--- :ecr: login (lk profile)"
-awscli ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
-
-echo "--- :hammer: build + push ($TAG)"
-# amd64 only — the LiveKit box is a c6i (Intel) instance, not arm64 like the
-# app's t4g box (see ardiustech/watercooler's infrastructure/livekit/README.md
-# "Notes / decisions": LiveKit is CPU-bound on media forwarding, x86_64 is the
-# well-trodden path). No emulation/binfmt needed since the agent is already
-# amd64.
-docker buildx build --platform linux/amd64 \
-  -t "$IMAGE:$TAG" -t "$IMAGE:latest" --push .
 
 # Refuse to send a SECOND deploy command while one is already in flight
 # against this instance (review finding, 2026-08-02 — this is the guard that
