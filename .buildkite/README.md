@@ -1,46 +1,92 @@
-# Buildkite CI/CD
+# CI/CD: GitHub Actions (CI) + Buildkite (CD only)
 
-CI/CD runs on Buildkite (org `gusto`), pipeline slug **`tax-credits-livekit-server`**.
-`pipeline.yml` defines the steps; the CI step runs hermetically via the `docker`
-plugin on the shared `default_stable` queue, matching
-`ardiustech/watercooler`'s own pipeline conventions.
+CI (build/vet/test) runs on **GitHub Actions** — `.github/workflows/buildtest.yaml`.
+CD (build+push+deploy) runs on **Buildkite** (org `gusto`, pipeline slug
+**`tax-credits-livekit-server`**), triggered by a GitHub Deployment that CI
+creates on a successful push to `master`.
 
-Before this pipeline existed, this repo had **no CI/CD at all**: the inherited
-upstream `.github/workflows/buildtest.yaml` isn't wired in as a required
-status check (see "Also fix: make buildtest.yaml a required check" below),
-and deploy was a fully manual SSM runbook (see
-`ardiustech/watercooler`'s `infrastructure/livekit/README.md`, pre-this-pipeline
-version of "Rolling the LiveKit version").
+## Why split across two systems (read this first)
 
-## What runs
+This repo originally had **no CI/CD at all** (manual SSM deploy runbook), then
+briefly had a Buildkite pipeline doing both CI and CD. That Buildkite CI step
+never worked reliably: **18 straight build attempts** (2026-08-02/03) failed
+`go mod download`'s ~120+ fresh fetches from `proxy.golang.org` — different
+agent, different queue, every environmental lever tried:
 
-| Step | Image | Does |
+| Attempt | Result |
+|---|---|
+| `GOFLAGS=-buildvcs=false` | Fixed a real, separate git-ownership error, but not this |
+| `git config safe.directory` | Fixed the gofmt script's own git calls, but not this |
+| Removed `git fetch` (SSH host-key hang) | Fixed a real, separate hang, but not this |
+| `GOSUMDB=off` | No change |
+| `GOMAXPROCS=2` (suspected connection-rate limit) | No change |
+| Scoped `go vet`/`go test` off `./pkg/service` (traced one specific hang to `httpsnoop`'s dependency chain) | Fixed *that specific* hang; a *different* package hung on the next run |
+| Switched `default_stable` → `default` queue | No change (same failure, different queue) |
+| Disabled IPv6 (well-known Docker/Go Happy-Eyeballs hang pattern) | Ruled out — IPv6 was already disabled at the kernel level |
+| Gusto `cache-buildkite-plugin` internal cache | Correct long-term idea, but doesn't fix the *first* (seeding) build, which faces the same volume |
+
+Every one of these was a real, verified fix for *something* — several were
+genuine bugs in this pipeline — but none touched the actual root cause. The
+final, consistent signature across all 18 attempts: **the same identical
+`go mod download` finishes in 12 seconds from an unrelated network**, and on
+Buildkite it always dies at a *different* point (different package, different
+agent, different queue) after successfully fetching ~100+ dependencies. That
+shape — large fresh-fetch volume, not a specific host/queue/package — points
+to a **connection-count or rate limit in Buildkite's own network egress path**
+(a NAT gateway or security-group connection-tracking cap), not anything fixable
+in this repo's code or pipeline config. `ardiustech/tax-credits-mcp`'s own
+Buildkite Go build never hits this because its dependency graph is tiny by
+comparison (a single small Lambda function, not the full pion/WebRTC + gRPC +
+OpenTelemetry stack this repo pulls in).
+
+**The fix: don't run `go mod download` on Buildkite's network at all.**
+GitHub Actions runners aren't on that network. This mirrors
+`ardiustech/tax-credits-mcp`'s own working pipeline — the only other Go
+project in this org with in-repo evidence of an architecture that actually
+works end-to-end: GitHub Actions does CI, and on success creates a **GitHub
+Deployment**, which Buildkite is configured to trigger builds from (same
+`BUILDKITE_GITHUB_DEPLOYMENT_*` env vars, same trigger mechanism).
+
+If this ever needs revisiting: the Buildkite network issue is a
+`#build-stability` question for Gusto's infra team, not something owned by
+this repo.
+
+## What runs where
+
+| System | Step | Does |
 |---|---|---|
-| build · vet · test | `golang:1.26` (+ `redis-server` installed and started in-container) | `gofmt -l` (only files this PR/commit touches), `go build ./...`, `go vet ./...`, `go test -race` on every package **except** `./test/...` and `./pkg/service/...` |
-| deploy (graceful drain) | agent Docker | **master only**, after the above pass: build+push amd64 image, trigger on-box graceful-drain deploy via SSM |
+| GitHub Actions (`buildtest.yaml`, job `test`) | build/vet/test | `gofmt -l`, `go build ./...`, `go vet`/`go test -race` on every package except `./test/...` and `./pkg/service/...` (see below) |
+| GitHub Actions (`buildtest.yaml`, job `deploy`) | trigger | On push to `master`, after `test` passes: creates a GitHub Deployment (`environment: production`) |
+| Buildkite (`pipeline.yml`) | deploy (graceful drain) | Triggered by that deployment: build+push amd64 image, on-box graceful-drain deploy via SSM |
 
-**Why Redis is here at all:** some tests (`pkg/rtc/test`'s multi-node/agent cases) need a real Redis at `localhost:6379` — the same dependency the inherited upstream `buildtest.yaml` already provides via a GitHub Actions service container. Confirmed live on this pipeline's first real runs: `TestAgentMultiNode` panics with "unable to connect to redis" without one (build #2), and my own earlier local `go test ./...` checks had silently passed only because a `redis-server` happens to already be running on that machine — masking this everywhere except an actual clean CI run.
+**Why `./test/...` is excluded:** `TestMultinodeDataPublishing`,
+`TestDataPublishSlowSubscriber`, and `TestTurnRelay` do real end-to-end WebRTC
+UDP ICE/STUN/TURN work that a sandboxed CI container's networking can't always
+reliably support regardless of whether the code is correct — same category of
+pre-existing flakiness already documented for `pkg/rtc/transport_test.go`'s
+ICE tests in `ARDIUSTECH_FORK.md` (confirmed flaky on unmodified upstream code
+too). None of this fork's own changes live in `./test/...`; they're all under
+`./pkg/rtc/`. **Run `./test/...` manually against a real network before
+shipping anything that actually touches ICE/TURN/multi-node behavior** — CI
+going green isn't a substitute for that.
 
-**Why in-container, not a sidecar:** tried a `docker-compose` sidecar first (build #3) — `docker-compose-buildkite-plugin` doesn't correctly bind-mount the checkout the way `docker#v5.13.0` does (`fatal: not a git repository` / `does not contain main module`) and separately warns it doesn't properly support step-level array commands. Installing `redis-server` inside the same `golang` container as a background process (`apt-get install`, then `redis-server --daemonize yes`) sidesteps both: no cross-container networking or mount semantics to get right, and `localhost:6379` trivially resolves since it's the container's own loopback.
-
-**Why `./test/...` is excluded (confirmed live, build #4):** `TestMultinodeDataPublishing`, `TestDataPublishSlowSubscriber`, and `TestTurnRelay` failed — real end-to-end WebRTC tests doing actual UDP ICE/STUN reflexive-candidate gathering and TURN relay, which a generic sandboxed CI container's networking often can't reliably support (restricted/NATed UDP paths, no real TURN reachability) regardless of whether the code is correct. Same category of pre-existing flakiness already documented for `pkg/rtc/transport_test.go`'s ICE tests in `ARDIUSTECH_FORK.md` (confirmed flaky on completely unmodified upstream code too) — this just extends that same acceptance to the top-level package. None of this fork's own changes live in `./test/...`; they're all under `./pkg/rtc/`. **Run `./test/...` manually against a real network before shipping anything that actually touches ICE/TURN/multi-node behavior** — this gate going green isn't a substitute for that.
-
-**Why `./pkg/service/...` is also excluded (confirmed live, build #5):** its `docker_test.go` has a package-wide `TestMain` that calls `dockertest.NewPool`, which needs a real Docker daemon at `/var/run/docker.sock` — not reachable from inside this step's own container. Enabling that would need Docker-outside-of-Docker (mounting the agent's host socket in, plus reconciling the spawned sibling containers' networking with this container's own view of "localhost") — a real capability worth adding later, not attempted here on top of everything else this pipeline already needed fixing. None of the fork's changes live here either.
-
-The verify step needs no credentials. The deploy step (`.buildkite/steps/deploy.sh`)
-needs the CI AWS keys as **`LK_AWS_*`** secrets (below); without them it
-**soft-skips** (green, no deploy) — same pattern as watercooler's own `WC_AWS_*`.
-Named `LK_AWS_*` (not `WC_AWS_*` or bare `AWS_*`) because this is a **different
-IAM user**, scoped to only the `livekit-server` ECR repo and the LiveKit
-instance — it has no access to anything watercooler's own CD user can touch,
-and vice versa.
+**Why `./pkg/service/...` is also excluded:** its `docker_test.go` has a
+package-wide `TestMain` that calls `dockertest.NewPool`, needing a real Docker
+daemon. `ubuntu-latest` GitHub Actions runners *do* have Docker available
+natively (unlike the retired Buildkite container, which needed
+Docker-outside-of-Docker to get this at all) — this exclusion may no longer be
+necessary here, just kept for now to avoid re-litigating a fight already
+fought on Buildkite. Worth testing removal once this workflow has a few green
+runs. None of the fork's changes live here either.
 
 ## CD / auto-deploy
 
-On merge to `master`, the deploy step builds the amd64 image (tagged by commit
-SHA + `latest` — amd64 only, since the LiveKit box is a c6i x86_64 instance,
-not arm64 like the watercooler app box), pushes to ECR, and runs
-`/opt/livekit/deploy.sh <sha>` on the instance via SSM.
+On a successful `test` run for a push to `master`, `buildtest.yaml`'s `deploy`
+job creates a GitHub Deployment. Buildkite (configured to trigger off GitHub
+Deployments — see setup below) then runs the deploy step: builds the amd64
+image (tagged by commit SHA + `latest` — amd64 only, since the LiveKit box is
+a c6i x86_64 instance, not arm64 like the watercooler app box), pushes to ECR,
+and runs `/opt/livekit/deploy.sh <sha>` on the instance via SSM.
 
 **This is NOT a blue/green swap like watercooler's own app deploy.** LiveKit
 runs `network_mode: host` bound to fixed ports (7880 signaling, 7881/7882
@@ -81,8 +127,14 @@ this pipeline does. See `ardiustech/watercooler`'s
    lines: `LK_AWS_ACCESS_KEY_ID`, `LK_AWS_SECRET_ACCESS_KEY` (optional:
    `LK_AWS_REGION` default `us-west-2`, `ECR_REPO`, `INSTANCE_NAME_TAG`,
    `DEPLOY_ACCOUNT_ID`).
+4. **Enable "Trigger builds on deployments"** in this Buildkite pipeline's
+   GitHub settings (Buildkite → pipeline → Settings → GitHub) — without this,
+   the GitHub Deployment `buildtest.yaml` creates has nothing listening for
+   it, and the deploy step never runs.
 
-Until step 3 is done the deploy step soft-skips, so merges stay green.
+Until steps 3-4 are done the deploy step never triggers (or soft-skips if it
+does, per the `LK_AWS_*` check in `deploy.sh`), so pushes to `master` stay
+green with no deploy.
 
 **Separately, and just as important:** even once this deploys, the fork is
 still a no-op in production until:
@@ -106,30 +158,34 @@ aws ssm send-command --document-name AWS-RunShellScript \
   --profile ardius-admin-ardius-dev --region us-west-2
 ```
 
-### Also fix: make `buildtest.yaml` a required check
-
-Separate from this Buildkite pipeline: the inherited upstream
-`.github/workflows/buildtest.yaml` (Go tests + a Redis service container) runs
-on every push/PR to `master` today but isn't a **required** status check, so
-a PR can merge without it having passed (flagged in PR #1's third
-adversarial-review round). Once this pipeline's own PR merges, add both
-`test` (from `buildtest.yaml`) and this pipeline's checks as required status
-checks on `master` via branch protection — needs a GitHub admin on the
-`ardiustech` org (not something a repo-scoped token can set).
-
 ## One-time setup (requires Buildkite admin / `write_pipelines`)
 
 1. **Buildkite → Add pipeline.**
    - Name / slug: `tax-credits-livekit-server`
    - Repository: `git@github.com:ardiustech/livekit-server.git`
-   - Cluster/queue: the one that provides `default_stable` agents (matches
-     mithrin / watercooler).
+   - Cluster/queue: `default` (NOT `default_stable` — see the "Why split"
+     section above; `default` is what `tax-credits-mcp` uses and has no known
+     issue with Go dependency fetches, though CI itself has moved off
+     Buildkite entirely now so this mostly matters for the deploy step's own
+     `docker buildx build`, which has never been confirmed to hit the same
+     limit — untested, since every prior attempt died in the CI step before
+     deploy ever ran).
 2. **Initial step** (the only step configured in the UI):
    ```
    buildkite-agent pipeline upload
    ```
    Everything else is read from `.buildkite/pipeline.yml` in the repo.
-3. **Builds on PRs:** enable "Build pull requests" so PRs get checked.
+3. **Enable "Trigger builds on deployments"** (see Activate step 4 above).
+4. GitHub Actions must be enabled for this repo (Settings → Actions) — forks
+   have inherited workflows disabled by default until explicitly turned on.
+
+## Also required: make `test` a required status check
+
+Separate from either CI/CD system: add GitHub Actions' `test` job as a
+**required** status check on `master` via branch protection, so a PR can't
+merge without it passing (flagged in PR #1's third adversarial-review round,
+still not done as of this writing — needs a GitHub admin on the `ardiustech`
+org, not something a repo-scoped token can set).
 
 ## Inspecting builds (bk CLI)
 
