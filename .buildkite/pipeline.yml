@@ -175,19 +175,32 @@ steps:
             # alone only covers go build's OWN internal git usage, not the
             # explicit git commands in the gofmt-diff script).
             - "GOFLAGS=-mod=mod -buildvcs=false"
-            # GOSUMDB=off (confirmed live, builds #9-12, 2026-08-02): `go mod
-            # download` was reproducibly dying ~60-65s after "downloading
-            # github.com/olekukonko/errors" — on TWO DIFFERENT agents, ruling
-            # out one bad host. Working theory: a checksum-verification call
-            # to sum.golang.org is blocked/heavily rate-limited from this
-            # network and eventually gets killed with no error output. This
-            # is a CI container building a fork we already trust (this fork's
-            # own repo, not a random dependency), so skipping the public
-            # checksum DB here is an acceptable tradeoff for actually being
-            # able to build at all — go.sum itself still pins exact versions
-            # and hashes checked against THAT file, this only skips the
-            # extra round-trip to the public transparency log.
+            # GOSUMDB=off — kept as a real, independent hardening (this CI
+            # container builds a fork we already trust; go.sum still pins
+            # exact versions/hashes regardless), but NOT sufficient alone
+            # (confirmed live, builds #9-14): go mod download kept dying
+            # ~60-65s into fetching public dependencies on FIVE different
+            # agents across BOTH the default_stable and default queues, at a
+            # LATE, seemingly-arbitrary point each time (different package
+            # name per run) — ruling out one bad host, one queue, and one
+            # specific blocked package/checksum call.
             - "GOSUMDB=off"
+            # GOMAXPROCS=2 (confirmed live, build #14, 2026-08-02): the
+            # identical `go mod download` finished in 12s from an unrelated
+            # network, so this isn't proxy.golang.org being unreachable —
+            # it's specific to THIS repo's unusually large dependency graph
+            # (the full pion/WebRTC stack, gRPC, OpenTelemetry, dozens of
+            # packages) fetched with Go's default high fetch concurrency.
+            # ardiustech/tax-credits-mcp's own Buildkite pipeline builds a
+            # single small Lambda function (same golang:1.26 image, same
+            # -buildvcs=false) successfully — its dependency graph is far
+            # smaller and likely never approaches whatever connection-
+            # count/rate threshold this repo's graph reliably hits. Go's
+            # module-fetch concurrency scales with GOMAXPROCS; capping it
+            # throttles concurrent outbound connections without needing to
+            # know exactly which device in the egress path (NAT gateway,
+            # inspection proxy) is imposing the limit.
+            - "GOMAXPROCS=2"
 
   # Gate the deploy on the checks above passing.
   - wait
