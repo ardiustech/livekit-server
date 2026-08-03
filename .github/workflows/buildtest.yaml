@@ -232,10 +232,23 @@ jobs:
       # still mid-graceful-drain from a run GitHub already considers
       # finished. SSM's own command history is the source of truth, not any
       # state this job keeps.
-      - name: Check for an in-flight deploy
+      #
+      # Also checks for a prior SUCCESS against this exact commit (review
+      # finding, 2026-08-03): the retired create-deployment step's
+      # listDeployments-by-sha check doubled as this same dedup — dropping
+      # it silently lost the guard against a "Re-run all jobs" click on an
+      # already-succeeded run sending a second live graceful-drain restart
+      # to production for zero code change. This is the re-added version:
+      # since a deploy's SSM comment always embeds the commit SHA (see the
+      # trigger step below), a completed Success command whose comment
+      # contains this run's SHA means it's already deployed.
+      - name: Check for an in-flight or already-completed deploy
         if: steps.check-secrets.outputs.skip == 'false'
+        id: dedup-check
         run: |
           set -euo pipefail
+          TAG="${{ github.sha }}"
+
           in_flight="$(aws ssm list-commands \
             --filters "key=DocumentName,value=$DEPLOY_DOCUMENT" \
             --query "Commands[?Status=='InProgress' || Status=='Pending'].CommandId" \
@@ -244,6 +257,17 @@ jobs:
             echo "::error::a livekit-server deploy is already in flight (CommandId: $in_flight) — refusing to send a second one"
             echo "wait for it to finish, or inspect: aws ssm list-command-invocations --command-id $in_flight"
             exit 1
+          fi
+
+          already_deployed="$(aws ssm list-commands \
+            --filters "key=DocumentName,value=$DEPLOY_DOCUMENT" "key=Status,value=Success" \
+            --query "Commands[?contains(Comment, '$TAG')].CommandId" \
+            --output text 2>/dev/null || echo "")"
+          if [ -n "$already_deployed" ]; then
+            echo "commit $TAG was already successfully deployed (CommandId: $already_deployed) — skipping to avoid an unnecessary graceful-drain restart"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       # Trigger the on-box graceful-drain deploy via SSM and wait for it —
@@ -264,7 +288,7 @@ jobs:
       # `github.sha` is guaranteed by GitHub itself to be what actually
       # landed on `master`, not a value this job or an API caller can forge.
       - name: Trigger + poll on-box deploy via SSM
-        if: steps.check-secrets.outputs.skip == 'false'
+        if: steps.check-secrets.outputs.skip == 'false' && steps.dedup-check.outputs.skip != 'true'
         run: |
           set -euo pipefail
           TAG="${{ github.sha }}"
