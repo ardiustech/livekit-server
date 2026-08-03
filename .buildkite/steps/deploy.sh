@@ -58,12 +58,11 @@ POLL_ATTEMPTS="${DEPLOY_POLL_ATTEMPTS:-300}"
 # class-eliminating check: refuse to touch AWS credentials at all unless
 # $BUILDKITE_COMMIT is a real ancestor of origin/master, regardless of what
 # label the triggering deployment claimed.
-if [ -n "${BUILDKITE_COMMIT:-}" ]; then
-  git fetch --quiet origin master
-  if ! git merge-base --is-ancestor "$BUILDKITE_COMMIT" origin/master; then
-    echo "+++ :x: refusing to deploy $BUILDKITE_COMMIT — not an ancestor of origin/master" >&2
-    exit 1
-  fi
+[ -n "${BUILDKITE_COMMIT:-}" ] || { echo "+++ :x: refusing to deploy — BUILDKITE_COMMIT is unset" >&2; exit 1; }
+git fetch --quiet origin master
+if ! git merge-base --is-ancestor "$BUILDKITE_COMMIT" origin/master; then
+  echo "+++ :x: refusing to deploy $BUILDKITE_COMMIT — not an ancestor of origin/master" >&2
+  exit 1
 fi
 
 # Isolated AWS profile dir (never the agent's ~/.aws), cleaned up on exit.
