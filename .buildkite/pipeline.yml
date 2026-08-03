@@ -14,8 +14,21 @@
 # To wire this up, the Buildkite pipeline's initial step should be
 # `buildkite-agent pipeline upload`, which reads this file. See .buildkite/README.md.
 
+# queue: default (NOT default_stable, review finding 2026-08-02): go mod
+# download reproducibly hung ~60-65s into fetching public dependencies from
+# proxy.golang.org on 3 different default_stable agents, while the identical
+# `go mod download` against the identical commit finished in 12s from an
+# unrelated network — isolating the problem to default_stable's own network
+# path, not the code or this pipeline's config. ardiustech/tax-credits-mcp's
+# own Buildkite pipeline runs `go build` (same golang:1.26 image, same
+# -buildvcs=false flag) successfully in production on queue "default" — the
+# most direct evidence available that default_stable and default have
+# meaningfully different network configurations for exactly this kind of
+# public-dependency fetch. Using default here on that basis; worth reverting
+# once default_stable's underlying network issue is actually fixed upstream
+# (a #build-stability question, not something this pipeline can control).
 agents:
-  queue: default_stable
+  queue: default
 
 steps:
   - label: ":golang: build · vet · test"
