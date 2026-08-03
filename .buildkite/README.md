@@ -1,12 +1,12 @@
-# CI/CD: GitHub Actions (CI) + Buildkite (CD only)
+# CI/CD history (Buildkite retired 2026-08-03 — see `.github/workflows/buildtest.yaml`)
 
-CI (build/vet/test) **and** the image build+push both run on **GitHub
-Actions** — `.github/workflows/buildtest.yaml`. Buildkite (org `gusto`,
-pipeline slug **`tax-credits-livekit-server`**) now does only the final
-on-box deploy trigger (SSM), triggered by a GitHub Deployment that GitHub
-Actions creates once the image is already built and pushed to ECR.
+This directory is kept for history only. CI and CD both live entirely in
+**GitHub Actions** now (`.github/workflows/buildtest.yaml`): `test` runs
+build/vet/test, and `build-and-deploy` builds+pushes the image to ECR and
+runs the on-box SSM deploy directly. There is no Buildkite pipeline for this
+repo anymore.
 
-## Why split across two systems (read this first)
+## Why CI moved off Buildkite in the first place
 
 This repo originally had **no CI/CD at all** (manual SSM deploy runbook), then
 briefly had a Buildkite pipeline doing both CI and CD. That Buildkite CI step
@@ -35,53 +35,84 @@ agent, different queue) after successfully fetching ~100+ dependencies. That
 shape — large fresh-fetch volume, not a specific host/queue/package — points
 to a **connection-count or rate limit in Buildkite's own network egress path**
 (a NAT gateway or security-group connection-tracking cap), not anything fixable
-in this repo's code or pipeline config. `ardiustech/tax-credits-mcp`'s own
-Buildkite Go build never hits this because its dependency graph is tiny by
-comparison (a single small Lambda function, not the full pion/WebRTC + gRPC +
-OpenTelemetry stack this repo pulls in).
+in this repo's code or pipeline config.
 
-**The fix: don't run `go mod download` on Buildkite's network at all.**
-GitHub Actions runners aren't on that network. This mirrors
-`ardiustech/tax-credits-mcp`'s own working pipeline — the only other Go
-project in this org with in-repo evidence of an architecture that actually
-works end-to-end: GitHub Actions does CI, and on success creates a **GitHub
-Deployment**, which Buildkite is configured to trigger builds from (same
-`BUILDKITE_GITHUB_DEPLOYMENT_*` env vars, same trigger mechanism).
+**The fix at the time: don't run `go mod download` on Buildkite's network at
+all.** GitHub Actions runners aren't on that network. CI moved there; the
+Buildkite pipeline was kept around for CD (build+push+deploy) only, triggered
+by a GitHub Deployment — modeled on what looked like
+`ardiustech/tax-credits-mcp`'s own working pipeline.
 
-**Follow-up (2026-08-03):** the first version of this split still ran
-`docker buildx build` inside Buildkite's deploy step — and the Dockerfile's
-build stage runs `go mod download` too, so that step was carrying the exact
-same untested risk into the production deploy path (a post-merge adversarial
-review flagged this as a must-fix). The image build+push moved into GitHub
-Actions' `build-and-deploy` job as well; Buildkite's `deploy.sh` now only
-triggers and polls the on-box SSM deploy, and never touches
-`proxy.golang.org` at all.
+**Why not `go mod vendor` or a cached module proxy instead, at the time?**
+Both would also have eliminated the network fetch. Passed over in favor of
+GitHub Actions runners because that was a proven fix with no further
+validation needed, whereas `vendor/` adds a large checked-in directory (this
+repo's dependency graph includes pion/WebRTC + gRPC + OpenTelemetry) that has
+to stay in sync on every `go.mod` change, and a self-hosted module proxy is
+new infra to build and operate. If Buildkite's network issue is ever fixed at
+the infra level, this is a `#build-stability` question for Gusto's infra
+team, not something owned by this repo.
 
-**Why not `go mod vendor` or a cached module proxy instead?** Both would
-also eliminate the network fetch, and are materially simpler (single system,
-no cross-system Deployment handoff). Rejected here because they trade a
-proven, already-working fix (GitHub Actions runners, which reliably don't
-hit whatever limit Buildkite's network has) for an unproven one that would
-need its own validation against the same failure mode before trusting it on
-a production deploy path — `vendor/` also adds a large checked-in directory
-(this repo's dependency graph includes pion/WebRTC + gRPC + OpenTelemetry)
-that has to be kept in sync on every `go.mod` change, and a self-hosted
-module proxy is new infra to build and operate. If Buildkite's network issue
-ever gets fixed at the infra level (see below), either could be revisited
-as a way to collapse back to one system — but there's no evidence today that
-either actually avoids the limit, only that GitHub Actions does.
+## Why CD (build+push) also moved off Buildkite, 2026-08-03
 
-If this ever needs revisiting: the Buildkite network issue is a
-`#build-stability` question for Gusto's infra team, not something owned by
-this repo.
+The first version of the CI/CD split still ran `docker buildx build` inside
+Buildkite's deploy step — and the Dockerfile's build stage runs
+`go mod download` too, so that step carried the exact same untested risk into
+the production deploy path (a post-merge adversarial review flagged this as
+a must-fix). The image build+push moved into GitHub Actions'
+`build-and-deploy` job.
+
+## Why Buildkite was retired entirely, 2026-08-03
+
+At that point Buildkite's only remaining job was triggering the on-box SSM
+deploy off a GitHub Deployment. Two things killed that:
+
+1. **The trigger was silently broken the whole time.** Buildkite's "Trigger
+   builds on deployments" setting is literally named
+   `build_deployment_status_created` in its own provider-settings API — it
+   fires on the `deployment_status` webhook event, not plain `deployment`
+   creation. `createDeployment` alone never emits a status. The workflow
+   called `createDeployment` and nothing else, so a real merge (PR #7) built
+   and pushed the image successfully, created a Deployment record... and
+   Buildkite never triggered a build at all. No production impact resulted
+   (the on-box deploy never fired), but the whole CD chain had been a silent
+   no-op since it was introduced.
+
+2. **The reason Buildkite exists for CD elsewhere in this org doesn't apply
+   here.** Buildkite's agents are self-hosted EC2 instances inside Gusto's
+   own AWS account, with a cluster (`higher-envs`) purpose-built for
+   "connectivity to higher environments (production, staging, demo)" — a
+   real, deliberate trust boundary for touching Gusto's core production
+   account. This pipeline's target AWS account
+   (`ardius-admin-ardius-dev`) is a separate, lower-stakes account that
+   boundary doesn't protect, and this pipeline was never even assigned to
+   that cluster (ran unclustered, same generic pool as everything else).
+   `ardiustech/tax-credits-mcp`'s own workflow — the reference this
+   architecture was modeled on — has the identical missing-status gap, and
+   its Buildkite pipeline doesn't even appear in this org's pipeline list,
+   meaning that "known-working precedent" was never actually confirmed to
+   trigger live either.
+
+With neither the trigger mechanism nor the trust-boundary rationale holding
+up, `build-and-deploy` now runs the on-box SSM deploy directly (the same
+authorization/idempotency logic that lived in Buildkite's `deploy.sh` moved
+into a workflow step almost as-is — see `.github/workflows/buildtest.yaml`).
+This eliminates the entire cross-system Deployment/webhook coordination
+layer, and the class of bug in (1) with it.
+
+**Leftover infra from the retired Buildkite path** (not yet cleaned up, safe
+to remove whenever convenient): the `tax-credits-livekit-server` Buildkite
+pipeline itself (dormant — its GitHub trigger is now disabled), and the
+`buildkite/tax-credits-livekit-server/environment` AWS Secrets Manager
+secret (a duplicate of the `LK_AWS_*` GitHub repo secrets, no longer read by
+anything).
 
 ## What runs where
 
-| System | Step | Does |
-|---|---|---|
-| GitHub Actions (`buildtest.yaml`, job `test`) | build/vet/test | `gofmt -l`, `go build ./...`, `go vet`/`go test -race` on every package except `./test/...` and `./pkg/service/...` (see below) |
-| GitHub Actions (`buildtest.yaml`, job `build-and-deploy`) | build + push + trigger | On push to `master`, after `test` passes: builds + pushes the amd64 image to ECR, then creates a GitHub Deployment (`environment: production`) |
-| Buildkite (`pipeline.yml`) | deploy (graceful drain) | Triggered by that deployment: on-box graceful-drain deploy via SSM only — no build, no `go mod download` |
+| Job | Does |
+|---|---|
+| `test` | `gofmt -l`, `go build ./...`, `go vet`/`go test -race` on every package except `./test/...` and `./pkg/service/...` (see below) |
+| `build-and-deploy` | On push to `master`, after `test` passes: builds + pushes the amd64 image to ECR, checks for an in-flight deploy, triggers the on-box SSM deploy, and polls it to completion |
 
 **Why `./test/...` is excluded:** `TestMultinodeDataPublishing`,
 `TestDataPublishSlowSubscriber`, and `TestTurnRelay` do real end-to-end WebRTC
@@ -97,22 +128,20 @@ going green isn't a substitute for that.
 **Why `./pkg/service/...` is also excluded:** its `docker_test.go` has a
 package-wide `TestMain` that calls `dockertest.NewPool`, needing a real Docker
 daemon. `ubuntu-latest` GitHub Actions runners *do* have Docker available
-natively (unlike the retired Buildkite container, which needed
-Docker-outside-of-Docker to get this at all) — this exclusion may no longer be
-necessary here, just kept for now to avoid re-litigating a fight already
-fought on Buildkite. Worth testing removal once this workflow has a few green
-runs. None of the fork's changes live here either.
+natively — this exclusion may no longer be necessary here, just kept for now
+to avoid re-litigating a fight already fought on the old Buildkite CI step.
+Worth testing removal once this workflow has a few more green runs. None of
+the fork's changes live here either.
 
 ## CD / auto-deploy
 
-On a successful `test` run for a push to `master`, `buildtest.yaml`'s
-`build-and-deploy` job builds the amd64 image (tagged by commit SHA +
-`latest` — amd64 only, since the LiveKit box is a c6i x86_64 instance, not
-arm64 like the watercooler app box), pushes it to ECR, and creates a GitHub
-Deployment. Buildkite (configured to trigger off GitHub Deployments — see
-setup below) then runs the deploy step: it does **not** build or pull
-anything itself, it just triggers `/opt/livekit/deploy.sh <sha>` on the
-instance via SSM and polls for completion.
+On a successful `test` run for a push to `master`, `build-and-deploy` builds
+the amd64 image (tagged by commit SHA + `latest` — amd64 only, since the
+LiveKit box is a c6i x86_64 instance, not arm64 like the watercooler app
+box), pushes it to ECR, then triggers `/opt/livekit/deploy.sh <sha>` on the
+instance via SSM (the custom `watercooler-livekit-deploy-prod` document, not
+the generic `AWS-RunShellScript` — it can only ever run deploy.sh with a
+validated Tag) and polls for completion.
 
 **This is NOT a blue/green swap like watercooler's own app deploy.** LiveKit
 runs `network_mode: host` bound to fixed ports (7880 signaling, 7881/7882
@@ -146,29 +175,13 @@ this pipeline does. See `ardiustech/watercooler`'s
    terraform -chdir=infrastructure/livekit output -raw livekit_ci_access_key_id
    terraform -chdir=infrastructure/livekit output -raw livekit_ci_secret_access_key
    ```
-3. Set the same key pair in **both** places — the build+push job (GitHub
-   Actions) and the deploy-trigger job (Buildkite) both need it:
-   - **GitHub repo secrets** (`gh secret set` or Settings → Secrets and
-     variables → Actions on `ardiustech/livekit-server`):
-     `LK_AWS_ACCESS_KEY_ID`, `LK_AWS_SECRET_ACCESS_KEY`. Used by
-     `build-and-deploy`'s ECR login/push step.
-   - **AWS Secrets Manager**, same mechanism watercooler's own pipeline uses
-     (see its `.buildkite/README.md` for the exact account/region/secret-name
-     convention): secret `buildkite/tax-credits-livekit-server/environment`,
-     plaintext `KEY=value` lines: `LK_AWS_ACCESS_KEY_ID`,
-     `LK_AWS_SECRET_ACCESS_KEY` (optional: `LK_AWS_REGION` default
-     `us-west-2`, `ECR_REPO`, `INSTANCE_NAME_TAG`, `DEPLOY_ACCOUNT_ID`). Used
-     by `deploy.sh`'s SSM trigger — it no longer needs ECR push, only SSM
-     `SendCommand`, but reuses the same IAM user/key pair since its policy
-     already grants both.
-4. **Enable "Trigger builds on deployments"** in this Buildkite pipeline's
-   GitHub settings (Buildkite → pipeline → Settings → GitHub) — without this,
-   the GitHub Deployment `buildtest.yaml` creates has nothing listening for
-   it, and the deploy step never runs.
+3. Set as **GitHub repo secrets** (`gh secret set` or Settings → Secrets and
+   variables → Actions on `ardiustech/livekit-server`):
+   `LK_AWS_ACCESS_KEY_ID`, `LK_AWS_SECRET_ACCESS_KEY`. Used by
+   `build-and-deploy` for both the ECR login/push and the SSM deploy trigger.
 
-Until steps 3-4 are done the deploy step never triggers (or soft-skips if it
-does, per the `LK_AWS_*` check in `deploy.sh`), so pushes to `master` stay
-green with no deploy.
+Until step 3 is done, `build-and-deploy` soft-skips (per the `LK_AWS_*` check
+at the top of the job), so pushes to `master` stay green with no deploy.
 
 **Separately, and just as important:** even once this deploys, the fork is
 still a no-op in production until:
@@ -176,7 +189,10 @@ still a no-op in production until:
   the stock `livekit/livekit-server:vX.Y.Z` image to this repo's ECR
   repository — a deliberate go-live decision, not a side effect of this
   pipeline existing (matches the project's existing philosophy — see that
-  repo's `ARDIUSTECH_FORK.md`);
+  repo's `ARDIUSTECH_FORK.md`). Note: this only affects what a *fresh*
+  instance boots with — any successful CD deploy already overwrites the
+  running container's image regardless of what this variable says, since
+  `deploy.sh` always points at the fork's ECR repo;
 - `rtc.reconnect_on_publication_error: true` is set — this pipeline's
   companion change bakes it into the LiveKit config template by default, but
   it only takes effect once the box actually boots that config (a fresh
@@ -186,54 +202,25 @@ still a no-op in production until:
 
 Images are tagged by commit SHA. To roll back, run the previous SHA on the box:
 ```bash
-aws ssm send-command --document-name AWS-RunShellScript \
+aws ssm send-command --document-name watercooler-livekit-deploy-prod \
   --targets "Key=tag:Name,Values=watercooler-livekit-prod" \
-  --parameters 'commands=["/opt/livekit/deploy.sh <previous-sha>"]' \
+  --parameters 'Tag=<previous-sha>' \
   --profile ardius-admin-ardius-dev --region us-west-2
 ```
 
-## One-time setup (requires Buildkite admin / `write_pipelines`)
-
-1. **Buildkite → Add pipeline.**
-   - Name / slug: `tax-credits-livekit-server`
-   - Repository: `git@github.com:ardiustech/livekit-server.git`
-   - Cluster/queue: `default` (NOT `default_stable` — see the "Why split"
-     section above; `default` is what `tax-credits-mcp` uses. The deploy
-     step no longer runs `docker buildx build` at all — see "Follow-up
-     (2026-08-03)" above — so this choice is now moot for Go dependency
-     fetches specifically, but kept for consistency with `tax-credits-mcp`).
-2. **Initial step** (the only step configured in the UI):
-   ```
-   buildkite-agent pipeline upload
-   ```
-   Everything else is read from `.buildkite/pipeline.yml` in the repo.
-3. **Enable "Trigger builds on deployments"** (see Activate step 4 above).
-4. GitHub Actions is already enabled for this repo (confirmed 2026-08-03 —
-   the repo-level Actions permission was already `enabled: true`; the actual
-   blocker on a fork is that inherited workflow files aren't *registered*
-   until a `push`/`pull_request` event fires against them at least once,
-   which happened automatically when this fork's first CI-split PR opened).
-
 ## Branch/deployment protection (done, 2026-08-03)
 
-- `master` now requires the `test` GitHub Actions job as a passing status
-  check, plus 1 approving review, before a PR can merge (flagged in PR #1's
-  third adversarial-review round — this closes it).
-- The `production` GitHub Environment now restricts deployments to protected
-  branches only (i.e. `master`) — this closes the forgeable-trigger gap at
-  the GitHub-API layer itself, complementing (not replacing) `deploy.sh`'s
-  own `git merge-base --is-ancestor` check.
-- Buildkite's "Trigger builds on deployments" is enabled on this pipeline.
+- `master` requires the `test` GitHub Actions job as a passing status check,
+  plus 1 approving review, before a PR can merge (flagged in PR #1's third
+  adversarial-review round — this closes it).
+- `build-and-deploy` runs directly off a real `push` event to `master`
+  (gated by the branch protection above), not a separately-forgeable
+  trigger — `github.sha` is guaranteed by GitHub itself to be what actually
+  landed on `master`.
 
-This PR is itself the first real end-to-end exercise of `build-and-deploy`
-(buildx → ECR push → GitHub Deployment → Buildkite SSM trigger) since #6
-merged — a deliberate smoke test before pointing `infrastructure/livekit`'s
-`terraform.tfvars` `livekit_image` at this fork's ECR repo for real.
-
-## Inspecting builds (bk CLI)
+## Inspecting runs
 
 ```bash
-bk build list -p tax-credits-livekit-server
-bk build view  -p tax-credits-livekit-server <number>
-bk job log <job-id> -p tax-credits-livekit-server -b <number>
+gh run list --repo ardiustech/livekit-server --workflow buildtest.yaml
+gh run view <run-id> --repo ardiustech/livekit-server
 ```

@@ -17,13 +17,29 @@
 # maximal thoroughness, especially after the extended Buildkite investigation
 # this replaces.
 #
-# On success, the `deploy` job creates a GitHub Deployment, which triggers
-# ardiustech/livekit-server's Buildkite pipeline (configured to "Trigger
-# builds on deployments") to build + push the image and run the on-box
-# deploy — see .buildkite/pipeline.yml and .buildkite/README.md. Mirrors
-# ardiustech/tax-credits-mcp's own working split (GitHub Actions CI ->
-# GitHub Deployment -> Buildkite CD) — the only other Go project in this org
-# with in-repo evidence of what actually works end-to-end.
+# On success, `build-and-deploy` builds+pushes the image AND runs the on-box
+# SSM deploy itself — CD lives entirely in GitHub Actions now (2026-08-03).
+#
+# This used to hand off to a Buildkite pipeline via a GitHub Deployment
+# (mirroring what looked like ardiustech/tax-credits-mcp's own working
+# split). Retired after two real problems surfaced running it live:
+# 1. The GitHub Deployment -> Buildkite webhook handoff was silently
+#    broken the whole time (Buildkite's trigger fires on a
+#    `deployment_status` event, not plain `deployment` creation — a status
+#    call this workflow never made — so PR #7 merged, built + pushed the
+#    image successfully, and Buildkite never triggered at all).
+# 2. The actual reason Buildkite existed for OTHER pipelines in this org —
+#    self-hosted agents in Gusto's own network, with a `higher-envs`
+#    cluster specifically for reaching production — doesn't apply here.
+#    This pipeline's target AWS account (`ardius-admin-ardius-dev`) is a
+#    separate, lower-stakes account from the one that cluster protects, and
+#    this pipeline was never even assigned to it (ran unclustered). And
+#    `tax-credits-mcp`'s own "working" pipeline turned out to have the
+#    identical missing-status gap, and doesn't even appear in this org's
+#    Buildkite pipeline list — the precedent this was modeled on was never
+#    actually confirmed to trigger live either.
+# See .buildkite/README.md for the full retirement writeup and the
+# extended history of why CI moved off Buildkite in the first place.
 name: Test
 
 permissions:
@@ -129,16 +145,8 @@ jobs:
           go vet $pkgs
           go test -race $pkgs
 
-  # Builds + pushes the image AND triggers the on-box deploy — moved here in
-  # full (review finding, 2026-08-03) rather than leaving the build inside
-  # Buildkite's own step. The PR that introduced this split moved go
-  # build/vet/test off Buildkite's network but left `docker buildx build`
-  # (which ALSO runs `go mod download`, via the Dockerfile's build stage)
-  # running inside Buildkite's deploy step — completely untested against the
-  # exact failure mode that killed 18/18 prior CI attempts, just moved from
-  # blocking a CI gate to blocking an actual production deploy. Buildkite's
-  # only remaining job is the final SSM trigger, which never touched
-  # proxy.golang.org in the first place.
+  # Builds + pushes the image AND runs the on-box SSM deploy directly — no
+  # Buildkite involved (2026-08-03, see the top-of-file comment for why).
   build-and-deploy:
     name: Build, push, and deploy
     needs: test
@@ -148,27 +156,37 @@ jobs:
     # like the test job's group above: two out-of-order deploys completing
     # out of order could otherwise let an older commit silently redeploy
     # over a newer one, with everything reporting green. Queuing (not
-    # canceling) means they still run in submission order.
+    # canceling) means they still run in submission order. This is now the
+    # ONLY ordering guard (the in-flight SSM check below is a second,
+    # independent layer against a manual re-run racing a still-draining box).
     concurrency:
       group: livekit-server-deploy
       cancel-in-progress: false
     # Bounded so a hung run (stalled ECR login/push/SSM poll) drops out of
     # the queue instead of blocking every subsequent deploy behind it
-    # (review finding, 2026-08-03). Matches .buildkite/pipeline.yml's own
-    # deploy step timeout.
-    timeout-minutes: 25
+    # (review finding, 2026-08-03). 35, not 25: the SSM poll step alone
+    # budgets a full 25 min (300 * 5s — real margin over the on-box
+    # DRAIN_TIMEOUT of up to 900s/15min), and that budget shares this SAME
+    # job-level timeout with checkout/buildx/ECR-login/build/push ahead of
+    # it (observed ~1.5min on a cold run, but unmeasured worst case with no
+    # docker layer cache configured). A bare 25 here would let GitHub kill
+    # the job mid-poll on any build that runs long, producing a hard
+    # timeout instead of the poll step's own graceful "still draining,
+    # don't retry blindly" message.
+    timeout-minutes: 35
     permissions:
-      # Job-level permissions REPLACE workflow defaults, not merge with them
-      # (review finding, 2026-08-03) — contents: read is required for the
-      # actions/checkout step below to authenticate its git fetch.
+      # contents: read is required for the actions/checkout step below to
+      # authenticate its git fetch. No `deployments: write` needed anymore —
+      # this job no longer creates a GitHub Deployment at all.
       contents: read
-      deployments: write
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.LK_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.LK_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-west-2
       ECR_REGISTRY: "396735084811.dkr.ecr.us-west-2.amazonaws.com"
       ECR_REPO: livekit-server
+      DEPLOY_DOCUMENT: watercooler-livekit-deploy-prod
+      INSTANCE_TAG: watercooler-livekit-prod
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -206,46 +224,87 @@ jobs:
             -t "$ECR_REGISTRY/$ECR_REPO:latest" \
             --push .
 
-      # Idempotency check (review finding, 2026-08-03): a manual workflow
-      # re-run on an already-deployed SHA would otherwise create a
-      # duplicate deployment, triggering a redundant image build/push (now
-      # harmless, just wasted work — but ALSO a live SSM graceful-drain
-      # restart on the box for zero code change).
-      - name: Check for an existing deployment
+      # Refuse to send a second deploy while one is already in flight against
+      # this instance (ported verbatim from the retired Buildkite deploy.sh,
+      # review finding 2026-08-02 there). Still needed even with this job's
+      # own concurrency group above: that group only serializes GitHub
+      # Actions RUNS, not a manual "Re-run jobs" click racing a box that's
+      # still mid-graceful-drain from a run GitHub already considers
+      # finished. SSM's own command history is the source of truth, not any
+      # state this job keeps.
+      - name: Check for an in-flight deploy
         if: steps.check-secrets.outputs.skip == 'false'
-        id: check-deployment
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        with:
-          script: |
-            const existing = await github.rest.repos.listDeployments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.sha,
-              environment: 'production',
-            });
-            core.setOutput('exists', existing.data.length > 0 ? 'true' : 'false');
+        run: |
+          set -euo pipefail
+          in_flight="$(aws ssm list-commands \
+            --filters "key=DocumentName,value=$DEPLOY_DOCUMENT" \
+            --query "Commands[?Status=='InProgress' || Status=='Pending'].CommandId" \
+            --output text 2>/dev/null || echo "")"
+          if [ -n "$in_flight" ]; then
+            echo "::error::a livekit-server deploy is already in flight (CommandId: $in_flight) — refusing to send a second one"
+            echo "wait for it to finish, or inspect: aws ssm list-command-invocations --command-id $in_flight"
+            exit 1
+          fi
 
-      # environment: 'production' here MUST match .buildkite/pipeline.yml's
-      # `build.env("BUILDKITE_GITHUB_DEPLOYMENT_ENVIRONMENT") ==
-      # "production"` check exactly — a typo or rename on either side
-      # silently no-ops the trigger with no error on this side.
-      # required_contexts: [] deliberately bypasses GitHub's default
-      # wait-on-required-checks behavior for deployments — this job's own
-      # `needs: test` already provides the intended gating, so there's
-      # nothing left to wait on; without this, a future branch-protection
-      # change could leave deployments silently pending forever.
-      - name: Create GitHub Deployment
-        if: steps.check-secrets.outputs.skip == 'false' && steps.check-deployment.outputs.exists == 'false'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        with:
-          script: |
-            const deployment = await github.rest.repos.createDeployment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: context.sha,
-              environment: 'production',
-              auto_merge: false,
-              required_contexts: [],
-              description: 'Deploy livekit-server to production',
-            });
-            console.log(`Created deployment ${deployment.data.id}`);
+      # Trigger the on-box graceful-drain deploy via SSM and wait for it —
+      # ported from the retired Buildkite deploy.sh (see .buildkite/README.md
+      # for the full history of why this moved here). Uses the CUSTOM SSM
+      # document (ardiustech/watercooler's infrastructure/livekit/
+      # ssm_document.tf), not the AWS-managed AWS-RunShellScript — that
+      # document can only ever run deploy.sh with a validated Tag, closing
+      # off the arbitrary-shell-command surface the generic document would
+      # otherwise grant this CI credential.
+      #
+      # No separate merge-base/ancestor authorization check here (unlike the
+      # retired Buildkite step) — that check existed because the OLD trigger
+      # (a GitHub Deployment's environment label) was forgeable by anyone
+      # with `deployments: write` on the repo, for an arbitrary ref. This job
+      # instead runs directly off a real `push` event to `master`, gated by
+      # this repo's branch protection (required `test` check + 1 review) —
+      # `github.sha` is guaranteed by GitHub itself to be what actually
+      # landed on `master`, not a value this job or an API caller can forge.
+      - name: Trigger + poll on-box deploy via SSM
+        if: steps.check-secrets.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ github.sha }}"
+          POLL_ATTEMPTS=300
+
+          echo "--- trigger graceful-drain deploy via SSM"
+          CMD_ID="$(aws ssm send-command \
+            --document-name "$DEPLOY_DOCUMENT" \
+            --targets "Key=tag:Name,Values=$INSTANCE_TAG" \
+            --comment "livekit-server CD $TAG" \
+            --parameters "Tag=$TAG" \
+            --query 'Command.CommandId' --output text)"
+          echo "command id: $CMD_ID"
+
+          matched=0
+          for _ in 1 2 3; do
+            sleep 5
+            matched="$(aws ssm list-command-invocations --command-id "$CMD_ID" \
+              --query 'length(CommandInvocations)' --output text 2>/dev/null || echo 0)"
+            [ "$matched" != "0" ] && break
+          done
+          if [ "$matched" = "0" ]; then
+            echo "::error::SSM command matched zero instances for tag:Name=$INSTANCE_TAG"
+            exit 1
+          fi
+
+          for _ in $(seq 1 "$POLL_ATTEMPTS"); do
+            sleep 5
+            status="$(aws ssm list-command-invocations --command-id "$CMD_ID" \
+              --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo Pending)"
+            echo "deploy status: $status"
+            case "$status" in
+              Success) echo "deploy succeeded"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo "::error::deploy $status — on-box output:"
+                aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+                  --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text || true
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::timed out waiting for the on-box deploy (it may still complete — check: aws ssm list-command-invocations --command-id $CMD_ID)"
+          exit 1
