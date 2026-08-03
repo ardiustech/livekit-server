@@ -164,10 +164,45 @@ steps:
         go vet $pkgs
         go test -race $pkgs
     plugins:
+      # Caches the Go module directory across builds of THIS step on THIS
+      # branch (review finding, 2026-08-02 — the actual root cause of every
+      # prior fix's residual flakiness): builds #1-16 kept dying partway
+      # through `go mod download`'s ~120+ fresh fetches from proxy.golang.org
+      # — different agent, different queue, different specific package each
+      # time — while the identical download finished in 12s from an
+      # unrelated network. That pattern (large fresh-fetch volume, not a
+      # specific host/queue/package) points to a connection-count/rate limit
+      # somewhere in this network's egress path, not a fixable code issue.
+      # ardiustech/tax-credits-mcp's own working Buildkite Go build (same
+      # golang:1.26 image) never approaches that threshold because its
+      # dependency graph is tiny by comparison. Caching means only a NEW
+      # dependency (added since the last build on this branch) is ever
+      # fetched fresh — steady-state builds need zero or a handful of
+      # downloads instead of ~120+, which should stay well under whatever
+      # that threshold is. `internal_path:` (not `path:`/external cache) is
+      # the right tool here per this plugin's own docs: "speeds up runtime
+      # within a single step" across repeated runs of THIS step, restored
+      # automatically in the pre-command hook — no separate `restore:` block
+      # needed, and nothing here is shared with or readable by any other
+      # step. `GOMODCACHE` below points at a path INSIDE the docker-mounted
+      # checkout (`/workdir` on the container side) specifically because
+      # this plugin's cache mechanism runs on the HOST agent, not inside the
+      # container — a cache path outside the mounted checkout would be
+      # invisible to it and silently never get cached at all (an explicitly
+      # called-out mistake in the plugin's own README).
+      - ssh://git@github.com/Gusto/cache-buildkite-plugin.git#v2.10.0:
+          save:
+            name: livekit-server-go-mod-cache
+            internal_path: .gomodcache
+            max_internal_size: 1024
       - docker#v5.13.0:
           image: "golang:1.26"
           environment:
             - "CI=true"
+            # Host-visible path for the cache plugin above (see its comment)
+            # — NOT the image's own default ($HOME/go/pkg/mod), which lives
+            # outside the checkout and would never get cached.
+            - "GOMODCACHE=/workdir/.gomodcache"
             # -buildvcs=false (confirmed live, build #1, 2026-08-02): the
             # docker plugin's mounted checkout is owned by a different UID
             # than the container's user, tripping git's "dubious ownership"
